@@ -1,21 +1,16 @@
 """Download schematic symbols and footprints for KiCad 9 and Altium Designer.
 
-Supports multiple backends:
-1. Ultra Librarian (via Nexar/component search)
-2. SnapMagic/SnapEDA API (if API key available)
-3. Component Search Engine (Samacsys) via direct download links
-4. JLCPCB/EasyEDA (via easyeda2kicad for JLCPCB parts)
-
-Since most services lack public APIs, this module uses the best
-available approach for each: direct download URLs where possible,
-API calls where available, and clear fallback instructions.
+Backend priority:
+1. Nexar GraphQL API (official, supports KiCad + Altium, needs free API key)
+2. LCSC/EasyEDA via easyeda2kicad (KiCad only, no key needed)
+3. SnapMagic/SnapEDA API (if API key available)
+4. Fallback: manual download links for Ultra Librarian, CSE, SnapEDA
 """
 import json
 import logging
 import os
-import re
+import subprocess
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -23,33 +18,59 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Nexar GraphQL queries
+NEXAR_TOKEN_URL = "https://identity.nexar.com/connect/token"
+NEXAR_GRAPHQL_URL = "https://api.nexar.com/graphql/"
+
+NEXAR_SEARCH_QUERY = """
+query SearchParts($q: String!) {
+  supSearch(q: $q, limit: 3) {
+    results {
+      part {
+        mpn
+        manufacturer { name }
+        descriptions { text }
+        bestDatasheet { url }
+        cadModels {
+          provider
+          downloadUrl
+          format
+        }
+      }
+    }
+  }
+}
+"""
+
 
 class SymbolFetcher:
     """Fetch schematic symbols and PCB footprints for electronic components."""
 
-    SNAPMAGIC_API_BASE = "https://www.snapeda.com/api/v1"
-    CSE_BASE = "https://componentsearchengine.com"
-    UL_BASE = "https://app.ultralibrarian.com"
-
-    # Supported output formats
     FORMATS = {
         "kicad9": {
             "name": "KiCad 9",
             "extensions": [".kicad_sym", ".kicad_mod", ".step"],
-            "ul_format_id": "kicad",
         },
         "altium": {
             "name": "Altium Designer",
             "extensions": [".SchLib", ".PcbLib", ".step"],
-            "ul_format_id": "altium",
         },
     }
 
     def __init__(self, output_dir: str = "./symbols",
+                 nexar_client_id: str | None = None,
+                 nexar_client_secret: str | None = None,
                  snapmagic_api_key: str | None = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.nexar_id = nexar_client_id or os.getenv("NEXAR_CLIENT_ID", "")
+        self.nexar_secret = nexar_client_secret or os.getenv("NEXAR_CLIENT_SECRET", "")
         self.snapmagic_key = snapmagic_api_key or os.getenv("SNAPMAGIC_API_KEY", "")
+
+        self._nexar_token: str | None = None
+
+    # --- Public API ---
 
     def fetch(self, part_number: str, manufacturer: str = "",
               formats: list | None = None) -> dict:
@@ -72,202 +93,10 @@ class SymbolFetcher:
             if fmt not in self.FORMATS:
                 results["formats"][fmt] = {"error": f"Unknown format: {fmt}"}
                 continue
-
             result = self._try_fetch(part_number, manufacturer, fmt)
             results["formats"][fmt] = result
 
         return results
-
-    def _try_fetch(self, part_number: str, manufacturer: str, fmt: str) -> dict:
-        """Try multiple backends to fetch symbols."""
-        # Backend 1: SnapMagic API (if key available)
-        if self.snapmagic_key:
-            result = self._fetch_snapmagic(part_number, fmt)
-            if result.get("success"):
-                return result
-
-        # Backend 2: Ultra Librarian direct search
-        result = self._fetch_ultralibrarian(part_number, manufacturer, fmt)
-        if result.get("success"):
-            return result
-
-        # Backend 3: Component Search Engine download link
-        result = self._fetch_cse(part_number, fmt)
-        if result.get("success"):
-            return result
-
-        # Fallback: provide manual download instructions
-        return {
-            "success": False,
-            "part_number": part_number,
-            "format": fmt,
-            "manual_links": {
-                "Ultra Librarian": f"https://app.ultralibrarian.com/search?q={part_number}",
-                "SnapEDA": f"https://www.snapeda.com/search/?q={part_number}",
-                "Component Search Engine": f"https://componentsearchengine.com/search?term={part_number}",
-            },
-            "instructions": (
-                f"Automatic download not available for {part_number}. "
-                "Visit the links above to manually download the symbol/footprint."
-            ),
-        }
-
-    def _fetch_snapmagic(self, part_number: str, fmt: str) -> dict:
-        """Fetch from SnapMagic/SnapEDA API."""
-        if not self.snapmagic_key:
-            return {"success": False, "reason": "No SnapMagic API key"}
-
-        try:
-            resp = requests.get(
-                f"{self.SNAPMAGIC_API_BASE}/parts/search",
-                params={"q": part_number, "limit": 1},
-                headers={"Authorization": f"Bearer {self.snapmagic_key}"},
-                timeout=30,
-            )
-            if resp.status_code != 200:
-                return {"success": False, "reason": f"SnapMagic API error: {resp.status_code}"}
-
-            data = resp.json()
-            parts = data.get("results", [])
-            if not parts:
-                return {"success": False, "reason": "No results on SnapMagic"}
-
-            part = parts[0]
-            download_url = part.get("download_url")
-            if not download_url:
-                return {"success": False, "reason": "No download URL"}
-
-            # Download the file
-            fmt_info = self.FORMATS[fmt]
-            save_dir = self.output_dir / part_number / fmt
-            save_dir.mkdir(parents=True, exist_ok=True)
-
-            zip_path = save_dir / f"{part_number}.zip"
-            self._download_file(download_url, str(zip_path))
-
-            # Extract
-            files = self._extract_zip(str(zip_path), str(save_dir))
-
-            return {
-                "success": True,
-                "source": "SnapMagic",
-                "format": fmt,
-                "files": files,
-                "directory": str(save_dir),
-            }
-        except Exception as e:
-            return {"success": False, "reason": f"SnapMagic error: {e}"}
-
-    def _fetch_ultralibrarian(self, part_number: str, manufacturer: str,
-                               fmt: str) -> dict:
-        """Attempt to fetch from Ultra Librarian.
-
-        Note: Ultra Librarian does not have a fully public REST API.
-        This attempts to use their search endpoint and download links.
-        """
-        try:
-            # Search for the part
-            search_url = f"{self.UL_BASE}/api/v1/search"
-            resp = requests.get(
-                search_url,
-                params={"q": part_number, "manufacturer": manufacturer},
-                timeout=30,
-                headers={"Accept": "application/json"},
-            )
-
-            if resp.status_code == 200:
-                data = resp.json()
-                parts = data.get("parts", data.get("results", []))
-                if parts:
-                    part = parts[0]
-                    dl_url = part.get("download_url") or part.get("kicad_url" if fmt == "kicad9" else "altium_url")
-                    if dl_url:
-                        save_dir = self.output_dir / part_number / fmt
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        zip_path = save_dir / f"{part_number}.zip"
-                        self._download_file(dl_url, str(zip_path))
-                        files = self._extract_zip(str(zip_path), str(save_dir))
-                        return {
-                            "success": True,
-                            "source": "Ultra Librarian",
-                            "format": fmt,
-                            "files": files,
-                            "directory": str(save_dir),
-                        }
-
-            # UL API not publicly accessible — return search link
-            return {
-                "success": False,
-                "reason": "Ultra Librarian requires web browser login",
-                "search_url": f"https://app.ultralibrarian.com/search?q={part_number}",
-            }
-        except requests.exceptions.ConnectionError:
-            return {
-                "success": False,
-                "reason": "Ultra Librarian API not reachable",
-                "search_url": f"https://app.ultralibrarian.com/search?q={part_number}",
-            }
-        except Exception as e:
-            return {"success": False, "reason": f"Ultra Librarian error: {e}"}
-
-    def _fetch_cse(self, part_number: str, fmt: str) -> dict:
-        """Attempt to fetch from Component Search Engine (Samacsys)."""
-        try:
-            search_url = f"{self.CSE_BASE}/ga/model.php"
-            resp = requests.get(
-                search_url,
-                params={"partID": part_number},
-                timeout=30,
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                dl_url = data.get("download_url")
-                if dl_url:
-                    save_dir = self.output_dir / part_number / fmt
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    zip_path = save_dir / f"{part_number}.zip"
-                    self._download_file(dl_url, str(zip_path))
-                    files = self._extract_zip(str(zip_path), str(save_dir))
-                    return {
-                        "success": True,
-                        "source": "Component Search Engine",
-                        "format": fmt,
-                        "files": files,
-                        "directory": str(save_dir),
-                    }
-        except Exception:
-            pass
-
-        return {
-            "success": False,
-            "reason": "CSE requires browser authentication",
-            "search_url": f"https://componentsearchengine.com/search?term={part_number}",
-        }
-
-    def _download_file(self, url: str, save_path: str):
-        """Download a file from URL."""
-        resp = requests.get(url, timeout=60, stream=True)
-        resp.raise_for_status()
-        with open(save_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        logger.info("Downloaded: %s", save_path)
-
-    def _extract_zip(self, zip_path: str, extract_to: str) -> list:
-        """Extract a ZIP file and return list of extracted files."""
-        files = []
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(extract_to)
-                files = zf.namelist()
-            # Clean up zip
-            os.remove(zip_path)
-        except zipfile.BadZipFile:
-            logger.warning("Not a valid ZIP file: %s", zip_path)
-            # Keep the file, might be a direct symbol file
-            files = [os.path.basename(zip_path)]
-        return files
 
     def fetch_batch(self, bom: list, formats: list | None = None) -> dict:
         """Fetch symbols for an entire BOM.
@@ -289,14 +118,12 @@ class SymbolFetcher:
         for item in bom:
             pn = item.get("part_number", item.get("ManufacturerPartNumber", ""))
             mfr = item.get("manufacturer", item.get("Manufacturer", ""))
-
             if not pn:
                 continue
 
             result = self.fetch(pn, mfr, formats)
             results.append(result)
 
-            # Check if any format succeeded
             any_success = any(
                 r.get("success") for r in result.get("formats", {}).values()
             )
@@ -314,11 +141,7 @@ class SymbolFetcher:
         }
 
     def generate_manual_download_report(self, batch_result: dict) -> str:
-        """Generate a report of parts needing manual symbol download.
-
-        Returns:
-            Formatted text report with download links.
-        """
+        """Generate a report of parts needing manual symbol download."""
         lines = ["# Symbol/Footprint Download Report", ""]
 
         auto = [r for r in batch_result["results"]
@@ -332,7 +155,7 @@ class SymbolFetcher:
                 pn = r["part_number"]
                 for fmt, info in r.get("formats", {}).items():
                     if info.get("success"):
-                        lines.append(f"  - {pn} [{fmt}]: {info.get('source', 'unknown')}")
+                        lines.append(f"  - {pn} [{fmt}]: {info.get('source', '?')}")
             lines.append("")
 
         if manual:
@@ -343,9 +166,264 @@ class SymbolFetcher:
                 lines.append(f"### {pn}")
                 for fmt, info in r.get("formats", {}).items():
                     links = info.get("manual_links", {})
-                    if links:
-                        for name, url in links.items():
-                            lines.append(f"  - [{name}]({url})")
+                    for name, url in links.items():
+                        lines.append(f"  - [{name}]({url})")
                 lines.append("")
 
         return "\n".join(lines)
+
+    # --- Backend dispatch ---
+
+    def _try_fetch(self, part_number: str, manufacturer: str, fmt: str) -> dict:
+        """Try backends in priority order."""
+
+        # Backend 1: Nexar GraphQL (official API, best for both formats)
+        if self.nexar_id and self.nexar_secret:
+            result = self._fetch_nexar(part_number, fmt)
+            if result.get("success"):
+                return result
+
+        # Backend 2: easyeda2kicad (KiCad only, no API key needed)
+        if fmt == "kicad9":
+            result = self._fetch_easyeda(part_number)
+            if result.get("success"):
+                return result
+
+        # Backend 3: SnapMagic API (if key available)
+        if self.snapmagic_key:
+            result = self._fetch_snapmagic(part_number, fmt)
+            if result.get("success"):
+                return result
+
+        # Fallback: manual download links
+        return {
+            "success": False,
+            "part_number": part_number,
+            "format": fmt,
+            "manual_links": {
+                "Ultra Librarian": f"https://app.ultralibrarian.com/search?q={part_number}",
+                "SnapEDA": f"https://www.snapeda.com/search/?q={part_number}",
+                "Component Search Engine": f"https://componentsearchengine.com/search?term={part_number}",
+                "LCSC": f"https://www.lcsc.com/search?q={part_number}",
+            },
+            "instructions": (
+                f"Automatic download not available for {part_number} ({fmt}). "
+                "Visit the links above to download manually."
+            ),
+        }
+
+    # --- Backend 1: Nexar GraphQL ---
+
+    def _nexar_authenticate(self) -> str | None:
+        """Get Nexar access token via OAuth2 client credentials."""
+        if self._nexar_token:
+            return self._nexar_token
+
+        try:
+            resp = requests.post(
+                NEXAR_TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self.nexar_id,
+                    "client_secret": self.nexar_secret,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            self._nexar_token = resp.json()["access_token"]
+            logger.info("Nexar token acquired")
+            return self._nexar_token
+        except Exception as e:
+            logger.warning("Nexar auth failed: %s", e)
+            return None
+
+    def _fetch_nexar(self, part_number: str, fmt: str) -> dict:
+        """Fetch CAD models via Nexar GraphQL API."""
+        token = self._nexar_authenticate()
+        if not token:
+            return {"success": False, "reason": "Nexar authentication failed"}
+
+        try:
+            resp = requests.post(
+                NEXAR_GRAPHQL_URL,
+                json={"query": NEXAR_SEARCH_QUERY, "variables": {"q": part_number}},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = data.get("data", {}).get("supSearch", {}).get("results", [])
+            if not results:
+                return {"success": False, "reason": "No results on Nexar"}
+
+            part = results[0].get("part", {})
+            cad_models = part.get("cadModels", [])
+
+            if not cad_models:
+                return {"success": False, "reason": "No CAD models available"}
+
+            # Find matching format
+            fmt_info = self.FORMATS[fmt]
+            target_exts = fmt_info["extensions"]
+            downloaded_files = []
+            save_dir = self.output_dir / part_number / fmt
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            for model in cad_models:
+                dl_url = model.get("downloadUrl")
+                model_fmt = model.get("format", "")
+                if dl_url:
+                    fname = f"{part_number}_{model_fmt}"
+                    fpath = save_dir / fname
+                    try:
+                        self._download_file(dl_url, str(fpath))
+                        downloaded_files.append(fname)
+                    except Exception as e:
+                        logger.warning("Download failed for %s: %s", dl_url, e)
+
+            if downloaded_files:
+                return {
+                    "success": True,
+                    "source": "Nexar",
+                    "format": fmt,
+                    "files": downloaded_files,
+                    "directory": str(save_dir),
+                    "mpn": part.get("mpn"),
+                    "manufacturer": part.get("manufacturer", {}).get("name", ""),
+                }
+
+            return {"success": False, "reason": "No downloadable CAD models matched format"}
+        except Exception as e:
+            return {"success": False, "reason": f"Nexar error: {e}"}
+
+    # --- Backend 2: easyeda2kicad (LCSC/EasyEDA) ---
+
+    def _fetch_easyeda(self, part_number: str) -> dict:
+        """Fetch KiCad symbols via easyeda2kicad CLI tool.
+
+        This uses the LCSC/EasyEDA component library which has 2M+ parts.
+        No API key required. KiCad format only.
+        """
+        # Check if easyeda2kicad is installed
+        if not shutil.which("easyeda2kicad"):
+            # Try running as python module
+            try:
+                result = subprocess.run(
+                    ["python3", "-m", "easyeda2kicad", "--help"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    return {
+                        "success": False,
+                        "reason": "easyeda2kicad not installed. Run: pip install easyeda2kicad",
+                    }
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return {
+                    "success": False,
+                    "reason": "easyeda2kicad not installed. Run: pip install easyeda2kicad",
+                }
+
+        save_dir = self.output_dir / part_number / "kicad9"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # easyeda2kicad --full --lcsc_id <ID> --output <dir>
+            # It can also accept MPN directly
+            cmd = [
+                "python3", "-m", "easyeda2kicad",
+                "--full",
+                "--lcsc_id", part_number,
+                "--output", str(save_dir / part_number),
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+            )
+
+            if result.returncode == 0:
+                # List generated files
+                files = [f.name for f in save_dir.iterdir() if f.is_file()]
+                if files:
+                    return {
+                        "success": True,
+                        "source": "EasyEDA/LCSC",
+                        "format": "kicad9",
+                        "files": files,
+                        "directory": str(save_dir),
+                    }
+
+            return {
+                "success": False,
+                "reason": f"easyeda2kicad failed: {result.stderr[:200]}",
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "reason": "easyeda2kicad timed out"}
+        except Exception as e:
+            return {"success": False, "reason": f"easyeda2kicad error: {e}"}
+
+    # --- Backend 3: SnapMagic ---
+
+    def _fetch_snapmagic(self, part_number: str, fmt: str) -> dict:
+        """Fetch from SnapMagic/SnapEDA API."""
+        try:
+            resp = requests.get(
+                "https://www.snapeda.com/api/v1/parts/search",
+                params={"q": part_number, "limit": 1},
+                headers={"Authorization": f"Bearer {self.snapmagic_key}"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return {"success": False, "reason": f"SnapMagic API: {resp.status_code}"}
+
+            data = resp.json()
+            parts = data.get("results", [])
+            if not parts:
+                return {"success": False, "reason": "No results on SnapMagic"}
+
+            part = parts[0]
+            dl_url = part.get("download_url")
+            if not dl_url:
+                return {"success": False, "reason": "No download URL from SnapMagic"}
+
+            save_dir = self.output_dir / part_number / fmt
+            save_dir.mkdir(parents=True, exist_ok=True)
+            zip_path = save_dir / f"{part_number}.zip"
+            self._download_file(dl_url, str(zip_path))
+            files = self._extract_zip(str(zip_path), str(save_dir))
+
+            return {
+                "success": True,
+                "source": "SnapMagic",
+                "format": fmt,
+                "files": files,
+                "directory": str(save_dir),
+            }
+        except Exception as e:
+            return {"success": False, "reason": f"SnapMagic error: {e}"}
+
+    # --- Utilities ---
+
+    def _download_file(self, url: str, save_path: str):
+        """Download a file from URL."""
+        resp = requests.get(url, timeout=60, stream=True)
+        resp.raise_for_status()
+        with open(save_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        logger.info("Downloaded: %s", save_path)
+
+    def _extract_zip(self, zip_path: str, extract_to: str) -> list:
+        """Extract a ZIP file and return list of extracted files."""
+        files = []
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_to)
+                files = zf.namelist()
+            os.remove(zip_path)
+        except zipfile.BadZipFile:
+            logger.warning("Not a valid ZIP: %s", zip_path)
+            files = [os.path.basename(zip_path)]
+        return files
