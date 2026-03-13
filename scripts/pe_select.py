@@ -11,7 +11,7 @@ sys.path.insert(0, str(PE_ROOT))
 from pe_engine.selector import PowerComponentSelector
 from pe_engine.fom import FOMCalculator
 from pe_engine.datasheet_parser import parse_datasheet, parse_from_digikey_params
-from pe_engine.bom import BOMOptimizer
+from pe_engine.bom import BOMOptimizer, bom_to_csv, mosfet_selection_to_csv
 from pe_engine.symbol_fetcher import SymbolFetcher
 
 
@@ -33,6 +33,14 @@ def cmd_mosfet(args):
 
     if args.json:
         print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args.csv:
+        csv_out = mosfet_selection_to_csv(result, args.csv if args.csv != "stdout" else None)
+        if args.csv == "stdout":
+            print(csv_out)
+        else:
+            print(f"MOSFET selection exported to {csv_out}")
         return
 
     mock_tag = " [MOCK DATA]" if result.get("mock") else ""
@@ -347,6 +355,137 @@ def cmd_heatsink(args):
         )
 
 
+def cmd_bom(args):
+    """Optimize BOM for cost and check inventory."""
+    bom_opt = BOMOptimizer()
+
+    # Build component list from JSON file or args
+    if args.input:
+        with open(args.input) as f:
+            data = json.load(f)
+        components = data.get("components", data) if isinstance(data, dict) else data
+    else:
+        # Simple inline BOM from repeated --part args
+        components = []
+        if args.parts:
+            for part_spec in args.parts:
+                parts = part_spec.split(":")
+                pn = parts[0]
+                qty = int(parts[1]) if len(parts) > 1 else 1
+                desc = parts[2] if len(parts) > 2 else ""
+                components.append({
+                    "part_number": pn,
+                    "digikey_pn": pn,
+                    "quantity_per_unit": qty,
+                    "description": desc,
+                })
+
+    if not components:
+        print("Error: no components specified. Use --input BOM.json or --part PN:QTY")
+        return
+
+    result = bom_opt.optimize_bom(
+        components, args.quantity, check_inventory=not args.no_stock_check)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args.csv:
+        csv_out = bom_to_csv(result, args.csv if args.csv != "stdout" else None)
+        if args.csv == "stdout":
+            print(csv_out)
+        else:
+            print(f"BOM exported to {csv_out}")
+        return
+
+    # Pretty print
+    print(f"\n{'='*70}")
+    print(f"BOM Optimization — {args.quantity} units")
+    print(f"{'='*70}\n")
+
+    header = f"{'#':<3} {'Part':<22} {'Qty/u':<7} {'Total':<7} {'$/pc':<8} {'Line$':<10} {'Stock':<12} {'Status'}"
+    print(header)
+    print("-" * len(header))
+
+    for i, c in enumerate(result.get("components", []), 1):
+        stock_str = str(c.get("stock", "?"))
+        status = c.get("stock_alert") or "OK"
+        print(
+            f"{i:<3} {c['part_number']:<22} "
+            f"{c['qty_per_unit']:<7} "
+            f"{c['total_qty']:<7} "
+            f"${c.get('unit_price', 0) or 0:<7.2f} "
+            f"${c.get('line_cost', 0):<9.2f} "
+            f"{stock_str:<12} "
+            f"{status}"
+        )
+
+    print(f"\nTotal BOM cost: ${result.get('total_bom_cost', 0):.2f}")
+    print(f"Cost per unit:  ${result.get('cost_per_unit', 0):.2f}")
+
+    alerts = result.get("stock_alerts", [])
+    if alerts:
+        print(f"\n⚠ INVENTORY ALERTS:")
+        for a in alerts:
+            print(f"  {a['part_number']}: {a['alert']}"
+                  + (f" (shortage: {a['shortage']} pcs)" if a.get("shortage") else ""))
+
+
+def cmd_gate_resistor(args):
+    """Calculate gate resistors for a MOSFET."""
+    calc = FOMCalculator()
+    params = {
+        "Qg": args.qg,
+        "Ciss": args.ciss or 2000,
+        "Vgs_th": args.vth or 4.0,
+        "technology": "SiC" if args.sic else "Si",
+    }
+    result = calc.calculate_gate_resistors(
+        params,
+        driver_io_source=args.io_source,
+        driver_io_sink=args.io_sink,
+        fsw=args.fsw,
+    )
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    print(f"\nGate Resistor Calculation:")
+    print(f"  MOSFET: Qg={args.qg}nC, {'SiC' if args.sic else 'Si'}")
+    print(f"  Driver: Io_source={args.io_source}A, Io_sink={args.io_sink}A")
+    print(f"\n  Rg_on:  {result['Rg_on_ohm']}Ω → t_on={result['t_on_ns']:.0f}ns, P={result['P_rg_on_W']:.3f}W")
+    print(f"  Rg_off: {result['Rg_off_ohm']}Ω → t_off={result['t_off_ns']:.0f}ns, P={result['P_rg_off_W']:.3f}W")
+    print(f"  Vgs_on={result['Vgs_on']}V, Vgs_off={result['Vgs_off']}V")
+    for n in result.get("notes", []):
+        print(f"  Note: {n}")
+
+
+def cmd_bootstrap(args):
+    """Calculate bootstrap capacitor for high-side driver."""
+    calc = FOMCalculator()
+    params = {
+        "Qg": args.qg,
+        "technology": "SiC" if args.sic else "Si",
+    }
+    result = calc.bootstrap_capacitor(params, args.duty, args.fsw, args.vcc)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    print(f"\nBootstrap Capacitor Calculation:")
+    print(f"  MOSFET: Qg={args.qg}nC, {'SiC' if args.sic else 'Si'}")
+    print(f"  Duty_max={args.duty*100:.0f}%, Fsw={args.fsw/1e3:.0f}kHz, Vcc={args.vcc}V")
+    print(f"\n  C_boot minimum:     {result['C_boot_min_uF']:.3f} µF")
+    print(f"  C_boot recommended: {result['C_boot_recommended_uF']} µF ({result['dielectric']})")
+    print(f"  Voltage rating:     ≥ {result['V_rating_min']}V")
+    print(f"  Max ripple:         {result['V_ripple_max_V']}V")
+    for n in result.get("notes", []):
+        print(f"  Note: {n}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Power Electronics Component Selection Tool"
@@ -355,7 +494,8 @@ def main():
 
     # MOSFET selection
     mp = sub.add_parser("mosfet", help="Select MOSFETs for a converter")
-    mp.add_argument("--topology", default="dab", choices=["dab", "llc", "buck", "boost", "full_bridge"])
+    mp.add_argument("--topology", default="dab",
+                    choices=["dab", "llc", "cllc", "buck", "boost", "full_bridge", "npc", "t_type", "pfc"])
     mp.add_argument("--vin", type=float, default=400, help="Input voltage [V]")
     mp.add_argument("--vout", type=float, default=96, help="Output voltage [V]")
     mp.add_argument("--power", type=float, default=5000, help="Output power [W]")
@@ -364,6 +504,7 @@ def main():
     mp.add_argument("--budget", type=float, help="Max price per device [USD]")
     mp.add_argument("--n-devices", type=int, default=4, help="Number of MOSFETs")
     mp.add_argument("--json", action="store_true")
+    mp.add_argument("--csv", nargs="?", const="stdout", help="Export to CSV (file path or stdout)")
 
     # Gate driver selection
     gp = sub.add_parser("gate-driver", help="Select gate drivers for a MOSFET")
@@ -400,7 +541,8 @@ def main():
 
     # Power module selection
     pmp = sub.add_parser("power-module", help="Select power modules for high-power converters")
-    pmp.add_argument("--topology", default="dab", choices=["dab", "llc", "buck", "boost", "full_bridge", "inverter"])
+    pmp.add_argument("--topology", default="dab",
+                    choices=["dab", "llc", "cllc", "buck", "boost", "full_bridge", "inverter", "npc", "t_type", "pfc"])
     pmp.add_argument("--vin", type=float, default=800, help="Input voltage [V]")
     pmp.add_argument("--vout", type=float, default=400, help="Output voltage [V]")
     pmp.add_argument("--power", type=float, default=100000, help="Output power [W]")
@@ -420,6 +562,37 @@ def main():
     hp.add_argument("--cooling", default="forced_air", choices=["natural", "forced_air", "liquid"])
     hp.add_argument("--json", action="store_true")
 
+    # BOM optimization
+    bp = sub.add_parser("bom", help="Optimize BOM cost and check inventory")
+    bp.add_argument("--input", help="BOM JSON file")
+    bp.add_argument("--part", dest="parts", action="append",
+                    help="Part spec as PN:QTY[:DESC] (repeatable)")
+    bp.add_argument("--quantity", type=int, default=100, help="Production quantity [units]")
+    bp.add_argument("--no-stock-check", action="store_true", help="Skip inventory check")
+    bp.add_argument("--json", action="store_true")
+    bp.add_argument("--csv", nargs="?", const="stdout",
+                    help="Export to CSV (file path or stdout)")
+
+    # Gate resistor calculation
+    grp = sub.add_parser("gate-resistor", help="Calculate gate resistors")
+    grp.add_argument("--qg", type=float, default=95, help="MOSFET Qg [nC]")
+    grp.add_argument("--ciss", type=float, help="MOSFET Ciss [pF]")
+    grp.add_argument("--vth", type=float, help="Gate threshold voltage [V]")
+    grp.add_argument("--sic", action="store_true", help="SiC MOSFET")
+    grp.add_argument("--io-source", type=float, default=4.0, help="Driver source current [A]")
+    grp.add_argument("--io-sink", type=float, default=6.0, help="Driver sink current [A]")
+    grp.add_argument("--fsw", type=float, default=100e3, help="Switching frequency [Hz]")
+    grp.add_argument("--json", action="store_true")
+
+    # Bootstrap capacitor calculation
+    bsp = sub.add_parser("bootstrap", help="Calculate bootstrap capacitor")
+    bsp.add_argument("--qg", type=float, default=95, help="MOSFET Qg [nC]")
+    bsp.add_argument("--sic", action="store_true", help="SiC MOSFET")
+    bsp.add_argument("--duty", type=float, default=0.95, help="Max duty cycle")
+    bsp.add_argument("--fsw", type=float, default=100e3, help="Switching frequency [Hz]")
+    bsp.add_argument("--vcc", type=float, default=15.0, help="Driver supply voltage [V]")
+    bsp.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -433,6 +606,9 @@ def main():
         "symbols": cmd_symbols,
         "power-module": cmd_power_module,
         "heatsink": cmd_heatsink,
+        "bom": cmd_bom,
+        "gate-resistor": cmd_gate_resistor,
+        "bootstrap": cmd_bootstrap,
     }
     cmds[args.command](args)
 

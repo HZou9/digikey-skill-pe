@@ -1,4 +1,6 @@
-"""BOM optimization: pricing, availability, second-sourcing."""
+"""BOM optimization: pricing, availability, second-sourcing, CSV export."""
+import csv
+import io
 import sys
 from pathlib import Path
 
@@ -8,6 +10,14 @@ if _dk_root not in sys.path:
 
 from digikey_api.client import DigiKeyClient
 from digikey_api.config import Config as DigiKeyConfig
+
+
+# Stock thresholds for inventory alerts
+STOCK_THRESHOLDS = {
+    "critical": 0,       # out of stock
+    "low": 50,           # fewer than 50 pcs
+    "warning": 500,      # fewer than 500 pcs
+}
 
 
 class BOMOptimizer:
@@ -99,18 +109,60 @@ class BOMOptimizer:
 
         return subs
 
-    def optimize_bom(self, components: list, quantity: int = 100) -> dict:
+    def check_stock(self, part_number: str, required_qty: int = 0) -> dict:
+        """Check stock level and return alert status.
+
+        Args:
+            part_number: Manufacturer or DigiKey part number
+            required_qty: Required quantity for production
+
+        Returns:
+            Dict with stock level, status, and alert.
+        """
+        details = self.dk.product_details(part_number)
+        product = details.get("Product", {})
+        stock = product.get("QuantityAvailable", 0)
+
+        if stock == 0:
+            status = "critical"
+            alert = "OUT OF STOCK"
+        elif stock < STOCK_THRESHOLDS["low"]:
+            status = "low"
+            alert = f"LOW STOCK ({stock} pcs)"
+        elif stock < STOCK_THRESHOLDS["warning"]:
+            status = "warning"
+            alert = f"Limited ({stock} pcs)"
+        else:
+            status = "ok"
+            alert = None
+
+        # Check if stock covers required quantity
+        covers_demand = stock >= required_qty if required_qty > 0 else True
+
+        return {
+            "part_number": part_number,
+            "stock": stock,
+            "status": status,
+            "alert": alert,
+            "covers_demand": covers_demand,
+            "shortage": max(0, required_qty - stock) if required_qty > 0 else 0,
+        }
+
+    def optimize_bom(self, components: list, quantity: int = 100,
+                     check_inventory: bool = True) -> dict:
         """Optimize a BOM for cost.
 
         Args:
             components: List of dicts with part_number, quantity_per_unit, etc.
             quantity: Production quantity (units)
+            check_inventory: Whether to check stock levels
 
         Returns:
             Dict with optimized BOM, total cost, and suggestions.
         """
         total_cost = 0
         optimized = []
+        stock_alerts = []
 
         for comp in components:
             pn = comp.get("digikey_pn") or comp.get("part_number", "")
@@ -132,19 +184,135 @@ class BOMOptimizer:
             line_cost = (unit_price or 0) * total_qty
             total_cost += line_cost
 
-            optimized.append({
+            entry = {
                 "part_number": comp.get("part_number", pn),
+                "description": comp.get("description", ""),
                 "digikey_pn": pn,
                 "qty_per_unit": qty_per_unit,
                 "total_qty": total_qty,
                 "unit_price": unit_price,
                 "line_cost": line_cost,
                 "sweet_spot": pricing.get("sweet_spot_qty"),
-            })
+            }
+
+            # Check stock if requested
+            if check_inventory:
+                stock_info = self.check_stock(pn, total_qty)
+                entry["stock"] = stock_info["stock"]
+                entry["stock_status"] = stock_info["status"]
+                entry["stock_alert"] = stock_info["alert"]
+                entry["covers_demand"] = stock_info["covers_demand"]
+                if stock_info["alert"]:
+                    stock_alerts.append({
+                        "part_number": comp.get("part_number", pn),
+                        "alert": stock_info["alert"],
+                        "shortage": stock_info["shortage"],
+                    })
+
+            optimized.append(entry)
 
         return {
             "quantity": quantity,
             "components": optimized,
             "total_bom_cost": total_cost,
             "cost_per_unit": total_cost / quantity if quantity > 0 else 0,
+            "stock_alerts": stock_alerts,
         }
+
+
+def bom_to_csv(bom_result: dict, output_path: str | None = None) -> str:
+    """Export BOM optimization result to CSV.
+
+    Args:
+        bom_result: Result from BOMOptimizer.optimize_bom()
+        output_path: Path to save CSV (if None, returns string)
+
+    Returns:
+        CSV string or path to saved file.
+    """
+    components = bom_result.get("components", [])
+    if not components:
+        return ""
+
+    buf = io.StringIO()
+    fieldnames = [
+        "part_number", "description", "digikey_pn",
+        "qty_per_unit", "total_qty", "unit_price", "line_cost",
+        "stock", "stock_status", "sweet_spot",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for comp in components:
+        writer.writerow(comp)
+
+    # Summary row
+    writer.writerow({
+        "part_number": "TOTAL",
+        "line_cost": bom_result.get("total_bom_cost", 0),
+        "total_qty": f"Qty: {bom_result.get('quantity', 0)} units",
+    })
+
+    csv_str = buf.getvalue()
+
+    if output_path:
+        Path(output_path).write_text(csv_str)
+        return output_path
+
+    return csv_str
+
+
+def mosfet_selection_to_csv(result: dict, output_path: str | None = None) -> str:
+    """Export MOSFET selection result to CSV.
+
+    Args:
+        result: Result from PowerComponentSelector.select_mosfet()
+        output_path: Path to save CSV (if None, returns string)
+
+    Returns:
+        CSV string or path to saved file.
+    """
+    candidates = result.get("candidates", [])
+    if not candidates:
+        return ""
+
+    buf = io.StringIO()
+    fieldnames = [
+        "rank", "part_number", "manufacturer", "price",
+        "Rds_on_mOhm", "Qg_nC", "Vds_max_V",
+        "FOM_RdsQg", "FOM_RdsQoss", "FOM_RdsCoss",
+        "composite_score", "P_cond_W", "P_sw_W", "P_total_W",
+        "stock",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+
+    for i, c in enumerate(candidates, 1):
+        p = c.get("params", {})
+        f = c.get("foms")
+        l = c.get("losses")
+        row = {
+            "rank": i,
+            "part_number": c.get("part_number", ""),
+            "manufacturer": c.get("manufacturer", ""),
+            "price": c.get("price", 0),
+            "Rds_on_mOhm": p.get("Rds_on", ""),
+            "Qg_nC": p.get("Qg", ""),
+            "Vds_max_V": p.get("Vds_max", ""),
+            "FOM_RdsQg": f.rds_qg if f else "",
+            "FOM_RdsQoss": f.rds_qoss if f else "",
+            "FOM_RdsCoss": f.rds_coss if f else "",
+            "composite_score": c.get("composite_score", ""),
+            "P_cond_W": round(l.P_cond, 2) if l else "",
+            "P_sw_W": round(l.P_sw, 2) if l else "",
+            "P_total_W": round(l.P_total, 2) if l else "",
+            "stock": c.get("stock", ""),
+        }
+        writer.writerow(row)
+
+    csv_str = buf.getvalue()
+
+    if output_path:
+        Path(output_path).write_text(csv_str)
+        return output_path
+
+    return csv_str

@@ -13,6 +13,7 @@ from pe_engine.datasheet_parser import (
     _normalize_unit, _parse_number,
 )
 from pe_engine.selector import PowerComponentSelector
+from pe_engine.bom import BOMOptimizer
 
 
 # ---- FOM Calculator Tests ----
@@ -394,6 +395,236 @@ class TestPowerComponentSelector:
             "cooling": "natural",
         })
         assert "error" in result
+
+    def test_mosfet_npc_topology(self):
+        """NPC topology should work and return candidates."""
+        result = self.sel.select_mosfet({
+            "topology": "npc", "vin": 800, "vout": 400,
+            "power": 10000, "fsw": 50e3,
+        })
+        assert "candidates" in result
+        assert len(result["candidates"]) > 0
+
+    def test_mosfet_pfc_topology(self):
+        """PFC topology should work."""
+        result = self.sel.select_mosfet({
+            "topology": "pfc", "vin": 400, "vout": 800,
+            "power": 3000, "fsw": 65e3,
+        })
+        assert "candidates" in result
+
+    def test_mosfet_cllc_topology(self):
+        """CLLC topology should work."""
+        result = self.sel.select_mosfet({
+            "topology": "cllc", "vin": 400, "vout": 400,
+            "power": 5000, "fsw": 100e3,
+        })
+        assert "candidates" in result
+
+
+# ---- Gate Resistor Tests ----
+
+class TestGateResistor:
+
+    def setup_method(self):
+        self.calc = FOMCalculator()
+
+    def test_basic_gate_resistor(self):
+        params = {"Qg": 95, "Ciss": 2253, "technology": "Si"}
+        result = self.calc.calculate_gate_resistors(params)
+        assert result["Rg_on_ohm"] > 0
+        assert result["Rg_off_ohm"] > 0
+        assert result["t_on_ns"] > 0
+        assert result["t_off_ns"] > 0
+
+    def test_sic_gate_resistor(self):
+        params = {"Qg": 95, "Ciss": 2253, "technology": "SiC"}
+        result = self.calc.calculate_gate_resistors(params)
+        assert result["Vgs_on"] == 18
+        assert result["Vgs_off"] == -5
+        assert any("SiC" in n for n in result["notes"])
+
+    def test_gate_resistor_power(self):
+        params = {"Qg": 95, "technology": "Si"}
+        result = self.calc.calculate_gate_resistors(params, fsw=100e3)
+        assert result["P_rg_on_W"] >= 0
+        assert result["P_rg_off_W"] >= 0
+
+    def test_e24_rounding(self):
+        """Gate resistors should be E24 standard values."""
+        e24 = [1.0, 1.1, 1.2, 1.3, 1.5, 1.6, 1.8, 2.0, 2.2, 2.4, 2.7, 3.0,
+               3.3, 3.6, 3.9, 4.3, 4.7, 5.1, 5.6, 6.2, 6.8, 7.5, 8.2, 9.1]
+
+        def is_e24(val):
+            if val <= 0:
+                return False
+            while val >= 10:
+                val /= 10
+            while val < 1:
+                val *= 10
+            return any(abs(val - e) < 0.01 for e in e24)
+
+        params = {"Qg": 95, "technology": "SiC"}
+        result = self.calc.calculate_gate_resistors(params)
+        assert is_e24(result["Rg_on_ohm"])
+        assert is_e24(result["Rg_off_ohm"])
+
+
+# ---- Bootstrap Capacitor Tests ----
+
+class TestBootstrapCapacitor:
+
+    def setup_method(self):
+        self.calc = FOMCalculator()
+
+    def test_basic_bootstrap(self):
+        params = {"Qg": 95, "technology": "Si"}
+        result = self.calc.bootstrap_capacitor(params)
+        assert result["C_boot_min_uF"] > 0
+        assert result["C_boot_recommended_uF"] >= result["C_boot_min_uF"]
+        assert result["V_rating_min"] > 15  # must be > Vcc
+
+    def test_sic_bootstrap(self):
+        params = {"Qg": 95, "technology": "SiC"}
+        result = self.calc.bootstrap_capacitor(params)
+        assert any("SiC" in n for n in result["notes"])
+
+    def test_high_duty_warning(self):
+        params = {"Qg": 95, "technology": "Si"}
+        result = self.calc.bootstrap_capacitor(params, duty_max=0.95)
+        assert any("High duty" in n for n in result["notes"])
+
+    def test_standard_cap_value(self):
+        """Selected cap should be a standard value."""
+        standard = [0.1, 0.22, 0.47, 1.0, 2.2, 4.7, 10, 22, 47, 100]
+        params = {"Qg": 95}
+        result = self.calc.bootstrap_capacitor(params)
+        assert result["C_boot_recommended_uF"] in standard
+
+
+# ---- BOM Tests ----
+
+class TestBOMOptimizer:
+
+    def setup_method(self):
+        self.bom = BOMOptimizer()
+
+    def test_pricing_analysis(self):
+        result = self.bom.pricing_analysis("C3M0025065K-ND")
+        assert "tiers" in result
+        assert len(result["tiers"]) > 0
+        assert result["sweet_spot_qty"] >= 1
+        assert result["unit_price_1pc"] is not None
+
+    def test_check_stock(self):
+        result = self.bom.check_stock("C3M0025065K-ND", required_qty=10)
+        assert "stock" in result
+        assert "status" in result
+        assert result["status"] in ("ok", "warning", "low", "critical")
+        assert "covers_demand" in result
+
+    def test_optimize_bom(self):
+        components = [
+            {"part_number": "C3M0025065K", "digikey_pn": "C3M0025065K-ND",
+             "quantity_per_unit": 4},
+        ]
+        result = self.bom.optimize_bom(components, quantity=10)
+        assert result["quantity"] == 10
+        assert len(result["components"]) == 1
+        assert result["total_bom_cost"] > 0
+        assert result["cost_per_unit"] > 0
+        # Stock check should be included by default
+        assert "stock" in result["components"][0]
+
+    def test_optimize_bom_no_stock(self):
+        components = [
+            {"part_number": "C3M0025065K", "digikey_pn": "C3M0025065K-ND",
+             "quantity_per_unit": 4},
+        ]
+        result = self.bom.optimize_bom(components, quantity=10, check_inventory=False)
+        assert "stock" not in result["components"][0]
+
+
+# ---- CSV Export Tests ----
+
+class TestCSVExport:
+
+    def test_bom_csv_export(self):
+        from pe_engine.bom import bom_to_csv
+        bom_result = {
+            "quantity": 100,
+            "components": [
+                {"part_number": "C3M0025065K", "digikey_pn": "C3M0025065K-ND",
+                 "qty_per_unit": 4, "total_qty": 400,
+                 "unit_price": 8.50, "line_cost": 3400.0,
+                 "stock": 4523, "stock_status": "ok"},
+            ],
+            "total_bom_cost": 3400.0,
+            "cost_per_unit": 34.0,
+        }
+        csv_str = bom_to_csv(bom_result)
+        assert "part_number" in csv_str  # header
+        assert "C3M0025065K" in csv_str
+        assert "TOTAL" in csv_str
+        lines = csv_str.strip().split("\n")
+        assert len(lines) == 3  # header + 1 component + total
+
+    def test_mosfet_csv_export(self):
+        from pe_engine.bom import mosfet_selection_to_csv
+        sel = PowerComponentSelector()
+        result = sel.select_mosfet({
+            "topology": "dab", "vin": 400, "vout": 48,
+            "power": 5000, "fsw": 100e3,
+        })
+        csv_str = mosfet_selection_to_csv(result)
+        assert "part_number" in csv_str
+        assert "FOM_RdsQg" in csv_str
+        lines = csv_str.strip().split("\n")
+        assert len(lines) > 1  # header + at least 1 candidate
+
+    def test_csv_file_export(self, tmp_path):
+        from pe_engine.bom import bom_to_csv
+        bom_result = {
+            "quantity": 10,
+            "components": [
+                {"part_number": "TEST", "digikey_pn": "TEST-ND",
+                 "qty_per_unit": 1, "total_qty": 10,
+                 "unit_price": 1.0, "line_cost": 10.0},
+            ],
+            "total_bom_cost": 10.0,
+        }
+        out_file = str(tmp_path / "test_bom.csv")
+        result = bom_to_csv(bom_result, out_file)
+        assert result == out_file
+        assert Path(out_file).exists()
+        content = Path(out_file).read_text()
+        assert "TEST" in content
+
+
+# ---- Topology Weights Tests ----
+
+class TestTopologyWeights:
+
+    def test_npc_weights_exist(self):
+        assert "npc" in FOMCalculator.TOPOLOGY_WEIGHTS
+        w = FOMCalculator.TOPOLOGY_WEIGHTS["npc"]
+        assert abs(sum(w.values()) - 1.0) < 0.01
+
+    def test_cllc_weights_exist(self):
+        assert "cllc" in FOMCalculator.TOPOLOGY_WEIGHTS
+
+    def test_pfc_weights_exist(self):
+        assert "pfc" in FOMCalculator.TOPOLOGY_WEIGHTS
+        w = FOMCalculator.TOPOLOGY_WEIGHTS["pfc"]
+        # PFC is hard-switched → rds_qg should dominate
+        assert w["rds_qg"] >= w["rds_qoss"]
+
+    def test_t_type_weights_exist(self):
+        assert "t_type" in FOMCalculator.TOPOLOGY_WEIGHTS
+
+    def test_all_weights_sum_to_one(self):
+        for topo, w in FOMCalculator.TOPOLOGY_WEIGHTS.items():
+            assert abs(sum(w.values()) - 1.0) < 0.01, f"{topo} weights sum to {sum(w.values())}"
 
 
 if __name__ == "__main__":
