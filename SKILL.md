@@ -21,6 +21,12 @@ python scripts/pe_select.py mosfet --topology dab --vin 400 --vout 96 --power 50
 # Gate driver selection based on MOSFET parameters
 python scripts/pe_select.py gate-driver --qg 95 --rds 25 --sic --topology dab --fsw 100000
 
+# Power module selection for high-power converters (100kW+)
+python scripts/pe_select.py power-module --topology dab --vin 800 --vout 400 --power 200000 --fsw 20000 --cooling liquid --sic
+
+# Heatsink selection based on thermal requirements
+python scripts/pe_select.py heatsink --p-loss 100 --rth-jc 0.46 --tj-max 175 --cooling forced_air
+
 # Parse a MOSFET datasheet PDF
 python scripts/pe_select.py parse /path/to/datasheet.pdf
 
@@ -53,6 +59,17 @@ python scripts/pe_select.py symbols C3M0025065K --kicad --altium
    → Run `parse` command
    → Show extracted parameters with confidence levels
    → Calculate FOMs from parsed data
+
+5. **"I need a power module for a 200kW inverter"**
+   → Run `power-module` command with topology, voltage, power specs
+   → Show thermal analysis (Tj estimate, cooling requirement)
+   → Compare SiC module vs IGBT module trade-offs
+   → Note: for >200kW, recommend paralleling or custom modules
+
+6. **"What heatsink for this MOSFET at 100W loss?"**
+   → Run `heatsink` command with P_loss, RthJC, cooling type
+   → Show required Rth_SA and matching heatsinks
+   → Include thermal margin analysis
 
 ### FOM Knowledge Base
 

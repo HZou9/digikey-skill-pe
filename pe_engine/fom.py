@@ -60,7 +60,7 @@ class FOMCalculator:
 
         Args:
             params: Dict with keys like Rds_on (mΩ), Qg (nC), Qoss (nC),
-                    Coss (pF).
+                    Coss (pF), Eoss (µJ), Vds_max (V).
             price: Unit price in USD for FOM/$ calculation.
 
         Returns:
@@ -76,7 +76,14 @@ class FOMCalculator:
                 if price and price > 0:
                     foms.rds_qg_per_dollar = foms.rds_qg / price
 
+            # Qoss: use directly if available, otherwise estimate from Eoss
             qoss = params.get("Qoss")  # nC
+            if qoss is None:
+                eoss = params.get("Eoss")  # µJ
+                vds = params.get("Vds_max")  # V
+                if eoss is not None and vds is not None and vds > 0:
+                    # Qoss ≈ 2 × Eoss / Vds (nonlinear capacitance approx)
+                    qoss = 2 * eoss * 1000 / vds  # µJ→nJ, /V → nC
             if qoss is not None:
                 foms.rds_qoss = rds * qoss
 

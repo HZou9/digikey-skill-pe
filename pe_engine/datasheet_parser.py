@@ -70,16 +70,17 @@ class DatasheetResult:
 
 MOSFET_PATTERNS = {
     "Vds_max": [
-        r"V[_\s]?[Dd][Ss][Ss]?\b.*?(\d+\.?\d*)\s*V",
-        r"Drain[\s-]*Source\s+Voltage.*?(\d+\.?\d*)\s*V",
+        r"[Dd]rain[\s\-]*[Ss]ource\s+[Vv]oltage.*?(\d+\.?\d*)\s*V",
+        r"V[_\s]?DSS\s+(\d+)\s*V",
+        r"VDSS\s+(\d+)\s*V",
     ],
     "Vgs_max": [
-        r"V[_\s]?[Gg][Ss][Ss]?\b.*?[±]?\s*(\d+\.?\d*)\s*V",
+        r"V[_\s]?[Gg][Ss][Ss]\b.*?[±]?\s*(\d+\.?\d*)\s*V",
         r"Gate[\s-]*Source\s+Voltage.*?[±]?\s*(\d+\.?\d*)\s*V",
     ],
     "Id_max": [
-        r"I[_\s]?[Dd]\b.*?(\d+\.?\d*)\s*A",
-        r"Continuous\s+Drain\s+Current.*?(\d+\.?\d*)\s*A",
+        r"[Cc]ontinuous\s+[Dd]rain\s+[Cc]urrent.*?(\d+\.?\d*)\s*A",
+        r"I[_\s]?D\s*(?:@|,|=|\s)\s*T\s*[=<]\s*25.*?(\d+\.?\d*)\s*A",
     ],
     "Rds_on": [
         r"R[_\s]?[Dd][Ss]\s*\(?[Oo][Nn]\)?\s*.*?(\d+\.?\d*)\s*(m?Ω|mohm)",
@@ -151,8 +152,10 @@ GATE_DRIVER_PATTERNS = {
     ],
     "tr": [r"[Rr]ise\s+[Tt]ime.*?(\d+\.?\d*)\s*(ns|µs)"],
     "tf": [r"[Ff]all\s+[Tt]ime.*?(\d+\.?\d*)\s*(ns|µs)"],
-    "Vcc_min": [r"V[_\s]?[Cc][Cc].*?[Mm]in.*?(\d+\.?\d*)\s*V"],
-    "Vcc_max": [r"V[_\s]?[Cc][Cc].*?[Mm]ax.*?(\d+\.?\d*)\s*V"],
+    "Vcc_min": [r"V[_\s]?CC[I]?\s+[Ii]nput\s+[Ss]upply.*?[Mm]in.*?(\d+\.?\d*)\s*V",
+                 r"V[_\s]?CC[I]?\s+[Rr]ange.*?(\d+\.?\d*)\s*V"],
+    "Vcc_max": [r"V[_\s]?CC[I]?\s+[Ii]nput\s+[Ss]upply.*?[Mm]ax.*?(\d+\.?\d*)\s*V",
+                 r"V[_\s]?CC[I]?\s+[Rr]ange.*?to\s+(\d+\.?\d*)\s*V"],
     "CMTI": [r"CMTI.*?(\d+\.?\d*)\s*(V/ns|kV/µs)"],
     "isolation_voltage": [
         r"[Ii]solation\s+[Vv]oltage.*?(\d+\.?\d*)\s*(V|kV)",
@@ -189,6 +192,24 @@ def _normalize_unit(value: float, unit: str) -> tuple[float, str]:
     return value, unit
 
 
+# Default units for common parameters (used when table has no Unit column)
+DEFAULT_UNITS = {
+    "Vds_max": "V", "Vgs_max": "V", "Vgs_th": "V", "Vsd": "V",
+    "Vcc_min": "V", "Vcc_max": "V",
+    "Id_max": "A", "Pd_max": "W",
+    "Rds_on": "mOhm",
+    "Qg": "nC", "Qgs": "nC", "Qgd": "nC", "Qoss": "nC", "Qrr": "nC",
+    "Ciss": "pF", "Coss": "pF", "Crss": "pF",
+    "Eoss": "uJ", "Eon": "uJ", "Eoff": "uJ",
+    "trr": "ns",
+    "RthJC": "C/W", "RthJA": "C/W",
+    "isolation_voltage": "V",
+    "CMTI": "V/ns",
+    "Io_source": "A", "Io_sink": "A",
+    "tpd_rise": "ns", "tpd_fall": "ns", "tr": "ns", "tf": "ns",
+}
+
+
 def _parse_number(text: str) -> float | None:
     """Extract a number from text."""
     m = re.search(r"[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?", text.strip())
@@ -212,10 +233,10 @@ class DatasheetParser:
             return result
 
         with pdfplumber.open(pdf_path) as pdf:
-            # Extract text and tables from first 6 pages
+            # Extract text and tables from first 10 pages
             all_text = ""
             all_tables = []
-            for page in pdf.pages[:6]:
+            for page in pdf.pages[:10]:
                 text = page.extract_text() or ""
                 all_text += text + "\n"
                 tables = page.extract_tables()
@@ -242,6 +263,11 @@ class DatasheetParser:
                 # Try both
                 self._extract_params(all_text, all_tables, MOSFET_PATTERNS, result)
                 self._extract_params(all_text, all_tables, GATE_DRIVER_PATTERNS, result)
+
+            # Fill in default units for params that have no unit
+            for key, p in result.params.items():
+                if not p.unit and key in DEFAULT_UNITS:
+                    p.unit = DEFAULT_UNITS[key]
 
         return result
 
@@ -277,18 +303,40 @@ class DatasheetParser:
         return ""
 
     def _extract_manufacturer(self, text: str) -> str:
-        """Detect manufacturer from text."""
-        known = {
-            "infineon": "Infineon", "wolfspeed": "Wolfspeed", "cree": "Wolfspeed",
-            "onsemi": "onsemi", "on semiconductor": "onsemi",
-            "stmicroelectronics": "STMicroelectronics", "rohm": "ROHM",
-            "texas instruments": "Texas Instruments", "analog devices": "Analog Devices",
-            "vishay": "Vishay", "nexperia": "Nexperia", "toshiba": "Toshiba",
-            "microchip": "Microchip", "renesas": "Renesas",
-            "skyworks": "Skyworks", "silicon labs": "Silicon Labs",
-        }
+        """Detect manufacturer from text.
+
+        Uses first-page text (first ~40 lines) for priority detection,
+        then falls back to full text. This prevents false matches from
+        competitor part references deep in the document.
+        """
+        # Ordered by specificity: longer/more-specific names first to avoid
+        # "cree" matching before "texas instruments" on a TI datasheet.
+        known = [
+            ("texas instruments", "Texas Instruments"),
+            ("analog devices", "Analog Devices"),
+            ("on semiconductor", "onsemi"),
+            ("stmicroelectronics", "STMicroelectronics"),
+            ("silicon labs", "Silicon Labs"),
+            ("infineon", "Infineon"),
+            ("wolfspeed", "Wolfspeed"),
+            ("cree", "Wolfspeed"),
+            ("onsemi", "onsemi"),
+            ("rohm", "ROHM"),
+            ("vishay", "Vishay"),
+            ("nexperia", "Nexperia"),
+            ("toshiba", "Toshiba"),
+            ("microchip", "Microchip"),
+            ("renesas", "Renesas"),
+            ("skyworks", "Skyworks"),
+        ]
+        # Check first page (first ~40 lines) with priority
+        first_page = "\n".join(text.split("\n")[:40]).lower()
+        for key, name in known:
+            if key in first_page:
+                return name
+        # Fallback to full text
         tl = text.lower()
-        for key, name in known.items():
+        for key, name in known:
             if key in tl:
                 return name
         return ""
@@ -304,12 +352,15 @@ class DatasheetParser:
     def _extract_params(self, text: str, tables: list, patterns: dict,
                         result: DatasheetResult):
         """Extract parameters using regex patterns on text and tables."""
+        # Normalize text: collapse newline-split symbols like "V\nDSS" → "VDSS"
+        text_norm = re.sub(r'(\w)\n(\w)', r'\1\2', text)
+
         # First pass: search in raw text (catches inline specs)
         for param_name, regexes in patterns.items():
             if param_name in result.params:
                 continue
             for regex in regexes:
-                m = re.search(regex, text, re.IGNORECASE)
+                m = re.search(regex, text_norm, re.IGNORECASE)
                 if m:
                     groups = m.groups()
                     val = _parse_number(groups[0])
@@ -328,24 +379,39 @@ class DatasheetParser:
         # Second pass: search in table cells (more structured, higher confidence)
         for table in tables:
             self._parse_table(table, patterns, result)
+            # Also try parsing "Symbol + Value" tables (absolute max ratings)
+            self._parse_simple_table(table, patterns, result)
 
     def _parse_table(self, table: list, patterns: dict, result: DatasheetResult):
         """Parse a single table for parameters."""
         if not table or len(table) < 2:
             return
 
-        # Try to identify column roles from header row
+        # Try to identify column roles from header row(s)
+        # Some datasheets (e.g. ROHM) use multi-row headers where
+        # row 0 = ['Symbol', 'Conditions', 'Values', None, None]
+        # row 1 = [None, None, 'Min.', 'Typ.', 'Max.']
         header = table[0]
         if header is None:
             return
 
         col_map = self._identify_columns(header)
+        data_start = 1
+
+        # If header didn't have min/typ/max, check row 1 for sub-header
+        if not col_map or not any(k in col_map for k in ["min", "typ", "max"]):
+            if len(table) > 2:
+                merged = self._merge_header_rows(header, table[1])
+                col_map = self._identify_columns(merged)
+                if col_map:
+                    data_start = 2
+
         if not col_map:
             return
 
-        # Parse each row
+        # Parse each data row
         prev_cells = [None] * len(header)
-        for row in table[1:]:
+        for row in table[data_start:]:
             if row is None:
                 continue
             # Fill None cells from previous row (merged cells)
@@ -357,14 +423,23 @@ class DatasheetParser:
                     cells.append(cell)
             prev_cells = cells
 
-            # Get parameter cell text
+            # Get parameter cell text and normalize newlines in symbols
             param_text = ""
             if "param" in col_map and col_map["param"] < len(cells):
                 param_text = str(cells[col_map["param"]] or "")
             if "symbol" in col_map and col_map["symbol"] < len(cells):
-                param_text += " " + str(cells[col_map["symbol"]] or "")
+                sym_text = str(cells[col_map["symbol"]] or "")
+                param_text += " " + sym_text
 
-            if not param_text.strip():
+            # Normalize newline-separated symbols: "V\nDSS" → "VDSS",
+            # "R\nDS(on)" → "RDS(on)", "C\niss" → "Ciss", "Q\nrr" → "Qrr"
+            # Also strip footnote markers like "*5", "*1" from symbols
+            param_text_norm = re.sub(r'\s*\*\d+\s*', '', param_text)  # strip *5, *1, etc.
+            param_text_norm = re.sub(r'(\w)\n(\w)', r'\1\2', param_text_norm)
+            # Also collapse any remaining newlines
+            param_text_norm = param_text_norm.replace('\n', ' ')
+
+            if not param_text_norm.strip():
                 continue
 
             # Match against known patterns
@@ -373,7 +448,7 @@ class DatasheetParser:
                 matched = False
                 for regex in regexes:
                     # Simplified: just check if the parameter symbol is in the text
-                    if re.search(regex.split(r".*?")[0], param_text, re.IGNORECASE):
+                    if re.search(regex.split(r".*?")[0], param_text_norm, re.IGNORECASE):
                         matched = True
                         break
 
@@ -389,25 +464,54 @@ class DatasheetParser:
                         "Coss": ["coss", "c_oss"],
                         "Crss": ["crss", "c_rss"],
                         "Eoss": ["eoss", "e_oss"],
-                        "Vds_max": ["vdss", "v_dss", "vds"],
-                        "Vgs_max": ["vgss", "v_gss", "vgs"],
-                        "Id_max": ["id", "i_d"],
-                        "Vgs_th": ["vgs(th)", "v_gs(th)"],
+                        "Eon": ["eon", "e_on"],
+                        "Eoff": ["eoff", "e_off"],
+                        "Vds_max": ["vdss", "v_dss", "v(br)dss", "v (br)dss", "vds"],
+                        "Vgs_max": ["vgss", "v_gss", "vgs(max)"],
+                        "Id_max": ["continuous drain current", "id"],
+                        "Vgs_th": ["vgs(th)", "v_gs(th)", "vgs (th)"],
                         "Pd_max": ["pd", "p_d"],
                         "RthJC": ["rthjc", "rθjc", "r_θjc"],
                         "RthJA": ["rthja", "rθja", "r_θja"],
                         "Vsd": ["vsd", "v_sd"],
                         "trr": ["trr", "t_rr"],
                         "Qrr": ["qrr", "q_rr"],
+                        # Gate driver symbols
+                        "Io_source": ["ioa+", "iob+", "peak output source",
+                                      "source current", "io+"],
+                        "Io_sink": ["ioa-", "iob-", "peak output sink",
+                                    "sink current", "io-"],
+                        "tpd_rise": ["tpdlh", "t_pdlh", "propagation delay from inx to outx rising",
+                                     "propagation delay.*rising"],
+                        "tpd_fall": ["tpdhl", "t_pdhl", "propagation delay from inx to outx falling",
+                                     "propagation delay.*falling"],
+                        "tr": ["trise", "t_rise", "output rise time"],
+                        "tf": ["tfall", "t_fall", "output fall time"],
                     }
                     if param_name in symbol_map:
-                        pt_lower = param_text.lower()
+                        pt_lower = param_text_norm.lower()
                         for sym in symbol_map[param_name]:
-                            if sym in pt_lower:
-                                matched = True
-                                break
+                            # Support regex patterns in symbol entries
+                            if '.*' in sym or '\\b' in sym:
+                                if re.search(sym, pt_lower):
+                                    matched = True
+                                    break
+                            else:
+                                # Use word-boundary matching to prevent
+                                # "qg" matching in "qgd", "id" in "idss"
+                                escaped = re.escape(sym)
+                                if re.search(r'(?<![a-z])' + escaped + r'(?![a-z(])',
+                                             pt_lower):
+                                    matched = True
+                                    break
 
                 if matched:
+                    # Skip if this param already has a high-confidence value
+                    # (prevents merged-cell rows from overwriting, e.g. ID at
+                    # Tc=25°C being overwritten by ID at Tc=100°C)
+                    if param_name in result.params and result.params[param_name].confidence == "high":
+                        continue
+
                     # Extract min/typ/max values from row
                     vals = self._extract_row_values(cells, col_map)
                     unit = ""
@@ -416,6 +520,8 @@ class DatasheetParser:
                     conditions = ""
                     if "conditions" in col_map and col_map["conditions"] < len(cells):
                         conditions = str(cells[col_map["conditions"]] or "").strip()
+                        # Clean up newlines in conditions too
+                        conditions = conditions.replace('\n', ' ')
 
                     best_val = vals.get("typ") or vals.get("max") or vals.get("min")
                     if best_val is not None:
@@ -437,6 +543,127 @@ class DatasheetParser:
                             conditions=conditions,
                             confidence="high",
                         )
+
+    def _parse_simple_table(self, table: list, patterns: dict, result: DatasheetResult):
+        """Parse simple 'Symbol + Value' tables (absolute maximum ratings).
+
+        These tables have no Min/Typ/Max columns. Format examples:
+          ['Parameter', 'Symbol', 'Value', 'Unit']  (Wolfspeed)
+          [None, 'Symbol', 'Value']  (ROHM)
+        """
+        if not table or len(table) < 2:
+            return
+
+        header = table[0]
+        if header is None:
+            return
+
+        # Find symbol and value columns
+        sym_col = val_col = unit_col = param_col = None
+        for i, cell in enumerate(header):
+            if cell is None:
+                continue
+            cl = str(cell).lower().strip()
+            if cl in ("symbol", "sym", "sym."):
+                sym_col = i
+            elif cl in ("value", "values", "rating"):
+                val_col = i
+            elif cl in ("unit", "units"):
+                unit_col = i
+            elif any(k in cl for k in ["parameter", "description"]):
+                param_col = i
+
+        if sym_col is None or val_col is None:
+            return
+
+        # Only process if this table does NOT have min/typ/max (handled elsewhere)
+        has_minmax = any(str(c or "").lower().strip() in
+                         ("min", "min.", "typ", "typ.", "max", "max.")
+                         for c in header)
+        if has_minmax:
+            return
+
+        # Symbol map for absolute maximum ratings
+        abs_max_symbols = {
+            "Vds_max": ["vdss", "v_dss", "v(br)dss", "v (br)dss", "vds"],
+            "Id_max": ["id", "i_d"],
+            "Vgs_max": ["vgss", "v_gss", "vgs(max)"],
+            "Pd_max": ["pd", "p_d"],
+        }
+
+        for row in table[1:]:
+            if row is None:
+                continue
+            if sym_col >= len(row):
+                continue
+
+            sym_text = str(row[sym_col] or "")
+            # Also include parameter column text
+            full_text = sym_text
+            if param_col is not None and param_col < len(row):
+                full_text = str(row[param_col] or "") + " " + sym_text
+
+            # Strip footnotes and normalize newlines
+            full_text = re.sub(r'\s*\*\d+\s*', '', full_text)
+            full_text = re.sub(r'(\w)\n(\w)', r'\1\2', full_text)
+            full_text = full_text.replace('\n', ' ')
+
+            if not full_text.strip():
+                continue
+
+            ft_lower = full_text.lower().strip()
+
+            for param_name, symbols in abs_max_symbols.items():
+                if param_name not in patterns:
+                    continue
+                # Don't override high-confidence table values
+                if param_name in result.params and result.params[param_name].confidence == "high":
+                    continue
+
+                matched_sym = False
+                for sym in symbols:
+                    escaped = re.escape(sym)
+                    if re.search(r'(?<![a-z])' + escaped + r'(?![a-z(])', ft_lower):
+                        matched_sym = True
+                        break
+
+                if matched_sym and val_col < len(row):
+                    val_text = str(row[val_col] or "").split('\n')[0].strip()
+                    val = _parse_number(val_text)
+                    if val is not None:
+                        unit = ""
+                        if unit_col is not None and unit_col < len(row):
+                            unit = str(row[unit_col] or "").strip()
+                        norm_val, norm_unit = _normalize_unit(val, unit)
+                        result.params[param_name] = ParsedParam(
+                            name=param_name, symbol=param_name,
+                            value=norm_val, unit=norm_unit,
+                            max_val=norm_val,  # Absolute max ratings
+                            conditions="Absolute Maximum",
+                            confidence="high",
+                        )
+
+    def _merge_header_rows(self, row1: list, row2: list) -> list:
+        """Merge two header rows into one (for multi-row table headers).
+
+        Example:
+            row1 = ['Symbol', 'Conditions', 'Values', None, None]
+            row2 = [None, None, 'Min.', 'Typ.', 'Max.']
+            result = ['Symbol', 'Conditions', 'Min.', 'Typ.', 'Max.']
+        """
+        merged = []
+        max_len = max(len(row1), len(row2))
+        for i in range(max_len):
+            c1 = row1[i] if i < len(row1) else None
+            c2 = row2[i] if i < len(row2) else None
+            # Prefer sub-header (row2) if non-None, else use row1
+            if c2 is not None:
+                merged.append(c2)
+            elif c1 is not None:
+                merged.append(c1)
+            else:
+                merged.append(None)
+        return merged
 
     def _identify_columns(self, header: list) -> dict:
         """Identify column roles from header row."""
@@ -460,23 +687,58 @@ class DatasheetParser:
             elif cl in ("unit", "units"):
                 col_map["unit"] = i
 
-        # Need at least parameter column and one value column
+        # Need at least parameter or symbol column, plus one value column
         if "param" not in col_map and "symbol" not in col_map:
             return {}
         if not any(k in col_map for k in ["min", "typ", "max"]):
             return {}
+
+        # If we have "symbol" but not "param", treat symbol as the param column too
+        if "symbol" in col_map and "param" not in col_map:
+            col_map["param"] = col_map["symbol"]
+
         return col_map
 
     def _extract_row_values(self, cells: list, col_map: dict) -> dict:
-        """Extract min/typ/max from a table row."""
+        """Extract min/typ/max from a table row.
+
+        Handles:
+        - Standard columns: separate min/typ/max cells
+        - Multi-value cells: "22\\n32" → take first value (ROHM format)
+        - Space-separated values: "26 33 45" in min column when typ/max
+          columns are empty (TI format: min typ max crammed together)
+        """
         vals = {}
         for key in ["min", "typ", "max"]:
             if key in col_map and col_map[key] < len(cells):
                 cell = cells[col_map[key]]
                 if cell is not None:
-                    v = _parse_number(str(cell))
-                    if v is not None:
-                        vals[key] = v
+                    cell_str = str(cell).strip()
+                    if not cell_str or cell_str == '-':
+                        continue
+                    # Handle newline-separated values: take first line
+                    first_line = cell_str.split('\n')[0].strip()
+                    if first_line and first_line != '-':
+                        v = _parse_number(first_line)
+                        if v is not None:
+                            vals[key] = v
+
+        # TI format: if only min has a value but it contains multiple
+        # space-separated numbers, interpret as min typ max
+        if "min" in vals and "typ" not in vals and "max" not in vals:
+            min_col = col_map.get("min")
+            if min_col is not None and min_col < len(cells):
+                cell_str = str(cells[min_col] or "").split('\n')[0].strip()
+                nums = re.findall(r'[-+]?\d+\.?\d*', cell_str)
+                if len(nums) == 3:
+                    vals["min"] = float(nums[0])
+                    vals["typ"] = float(nums[1])
+                    vals["max"] = float(nums[2])
+                elif len(nums) == 2:
+                    # Could be min/max or typ/max
+                    vals["min"] = float(nums[0])
+                    vals["max"] = float(nums[1])
+
         return vals
 
     def _extract_conditions(self, text: str) -> str:

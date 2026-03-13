@@ -1,4 +1,5 @@
 """Intelligent power electronics component selection."""
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +33,14 @@ class PowerComponentSelector:
             "buck": "gate driver half-bridge bootstrap",
             "boost": "gate driver high-side",
             "full_bridge": "gate driver isolated",
+        },
+        "power_module": {
+            "dab": "SiC module half bridge {voltage}V",
+            "llc": "IGBT module half bridge {voltage}V",
+            "buck": "power module half bridge {voltage}V",
+            "boost": "power module boost {voltage}V",
+            "full_bridge": "IGBT module {voltage}V",
+            "inverter": "power module sixpack {voltage}V",
         },
     }
 
@@ -269,3 +278,362 @@ class PowerComponentSelector:
             "top_pick": pn,
             "total_bom_cost": total_cost,
         }
+
+    # --- Power Module Selection ---
+
+    def select_power_module(self, specs: dict) -> dict:
+        """Select power modules for high-power converters.
+
+        Args:
+            specs: Converter specifications
+                topology: str - 'dab', 'llc', 'full_bridge', 'inverter'
+                vin: float - Input voltage [V]
+                vout: float - Output voltage [V]
+                power: float - Output power [W]
+                fsw: float - Switching frequency [Hz]
+                cooling: str - 'air' or 'liquid' (default: 'air')
+                budget: float - Max price per module [USD] (optional)
+                prefer_sic: bool - Prefer SiC over IGBT (default: auto)
+
+        Returns:
+            Dict with ranked module candidates and thermal analysis.
+        """
+        topology = specs.get("topology", "dab")
+        vin = specs.get("vin", 800)
+        vout = specs.get("vout", 400)
+        power = specs.get("power", 100000)
+        fsw = specs.get("fsw", 20e3)
+        cooling = specs.get("cooling", "air")
+        budget = specs.get("budget")
+        prefer_sic = specs.get("prefer_sic")
+
+        v_required = max(vin, vout)
+        v_min_rating = v_required / 0.8
+
+        voltage_tiers = [600, 650, 900, 1200, 1700, 3300]
+        voltage = min((v for v in voltage_tiers if v >= v_min_rating), default=1700)
+
+        # Auto-decide SiC vs IGBT
+        if prefer_sic is None:
+            prefer_sic = fsw > 30e3 or voltage >= 1200
+
+        template = self.SEARCH_TEMPLATES["power_module"].get(
+            topology, "power module half bridge {voltage}V")
+        query = template.format(voltage=voltage)
+
+        if prefer_sic and "sic" not in query.lower():
+            query = query.replace("IGBT", "SiC").replace("igbt", "SiC")
+            if "SiC" not in query:
+                query += " SiC"
+
+        results = self.dk.keyword_search(query, limit=10)
+        products = results.get("Products", [])
+
+        if not products:
+            return {"error": "No power modules found", "query": query, "candidates": []}
+
+        # Estimate required module current
+        i_rms = power / (v_required * 0.9)
+        t_ambient = 40.0 if cooling == "air" else 30.0
+
+        candidates = []
+        for p in products:
+            params = self._parse_module_params(p.get("Parameters", []))
+
+            if budget and p.get("UnitPrice", 0) > budget:
+                continue
+
+            ic = params.get("Ic_25C", 0)
+            if ic < i_rms * 0.5:
+                continue
+
+            # Thermal estimate
+            rth_jc = params.get("RthJC", 0.05)
+            pd_max = params.get("Pd_max", 2000)
+            p_loss_est = power * 0.02  # rough 2% loss estimate
+
+            if cooling == "liquid":
+                rth_total = rth_jc + 0.05  # cold plate ~ 0.05°C/W
+            else:
+                rth_total = rth_jc + 0.3  # forced air heatsink ~ 0.3°C/W
+
+            tj_est = t_ambient + p_loss_est * rth_total
+            tj_max = 175 if params.get("technology") == "SiC" else 150
+
+            cand = {
+                "part_number": p.get("ManufacturerPartNumber", ""),
+                "manufacturer": p.get("Manufacturer", ""),
+                "digikey_pn": p.get("DigiKeyPartNumber", ""),
+                "price": p.get("UnitPrice", 0),
+                "stock": p.get("QuantityAvailable", 0),
+                "datasheet": p.get("DatasheetUrl", ""),
+                "description": p.get("Description", ""),
+                "params": params,
+                "thermal": {
+                    "Tj_estimated_C": round(tj_est, 1),
+                    "Tj_max_C": tj_max,
+                    "thermal_ok": tj_est < tj_max * 0.9,
+                    "P_loss_estimated_W": round(p_loss_est, 1),
+                    "cooling": cooling,
+                },
+                "current_margin_pct": round((ic / i_rms - 1) * 100, 0) if i_rms > 0 else 0,
+                "voltage_derating": self.fom.voltage_derating(
+                    params.get("Vces", voltage), v_required),
+            }
+            candidates.append(cand)
+
+        # Sort: prefer adequate current, good thermal margin, lower price
+        candidates.sort(key=lambda c: (
+            not c["thermal"]["thermal_ok"],
+            -c["current_margin_pct"],
+            c["price"],
+        ))
+
+        recommendation = self._generate_module_recommendation(
+            candidates, specs, power)
+
+        return {
+            "query": query,
+            "specs": specs,
+            "candidates": candidates,
+            "recommendation": recommendation,
+            "mock": results.get("_mock", False),
+        }
+
+    def _parse_module_params(self, parameters: list) -> dict:
+        """Parse power module parameters from DigiKey API response."""
+        specs = {}
+        for p in parameters:
+            name = p.get("Name", "")
+            value = p.get("Value", "")
+
+            if "Voltage - Collector Emitter" in name or "Vces" in name:
+                m = re.search(r"(\d+\.?\d*)\s*V", value)
+                if m:
+                    specs["Vces"] = float(m.group(1))
+
+            elif "Current - Collector" in name and "25°C" in name:
+                m = re.search(r"(\d+\.?\d*)\s*A", value)
+                if m:
+                    specs["Ic_25C"] = float(m.group(1))
+
+            elif "Current - Collector" in name and "80°C" in name:
+                m = re.search(r"(\d+\.?\d*)\s*A", value)
+                if m:
+                    specs["Ic_80C"] = float(m.group(1))
+
+            elif "Rds On" in name:
+                m = re.search(r"(\d+\.?\d*)\s*(m?Ω|mohm)", value, re.IGNORECASE)
+                if m:
+                    v = float(m.group(1))
+                    specs["Rds_on"] = v if "m" in m.group(2).lower() else v * 1000
+
+            elif "Vce(sat)" in name:
+                m = re.search(r"(\d+\.?\d*)\s*V", value)
+                if m:
+                    specs["Vce_sat"] = float(m.group(1))
+
+            elif "Power Dissipation" in name:
+                m = re.search(r"(\d+\.?\d*)\s*W", value)
+                if m:
+                    specs["Pd_max"] = float(m.group(1))
+
+            elif "Thermal Resistance Junction-Case" in name:
+                m = re.search(r"(\d+\.?\d*)\s*°C/W", value)
+                if m:
+                    specs["RthJC"] = float(m.group(1))
+
+            elif "Eon + Eoff" in name:
+                m = re.search(r"(\d+\.?\d*)\s*(m?J)", value)
+                if m:
+                    v = float(m.group(1))
+                    specs["Esw"] = v if "m" in m.group(2) else v * 1000
+
+            elif "Module Type" in name:
+                specs["module_type"] = value
+
+            elif "Technology" in name:
+                specs["technology"] = value
+                if "sic" in value.lower():
+                    specs["is_sic"] = True
+
+            elif "Package" in name or "Case" in name:
+                specs["package"] = value
+
+        return specs
+
+    def _generate_module_recommendation(self, ranked: list, specs: dict,
+                                        power: float) -> dict:
+        """Generate recommendation for power module selection."""
+        if not ranked:
+            return {"text": "No suitable power modules found."}
+
+        top = ranked[0]
+        pn = top["part_number"]
+        mfr = top["manufacturer"]
+        price = top.get("price", 0)
+        tech = top["params"].get("technology", "")
+        ic = top["params"].get("Ic_25C", "?")
+        vces = top["params"].get("Vces", "?")
+
+        lines = [
+            f"Recommended: {pn} ({mfr})",
+            f"  Technology: {tech}",
+            f"  Rating: {vces}V / {ic}A",
+            f"  Thermal: Tj={top['thermal']['Tj_estimated_C']}°C "
+            f"({'OK' if top['thermal']['thermal_ok'] else 'WARNING'})",
+            f"  Price: ${price:.2f}",
+        ]
+
+        if power > 200000:
+            lines.append("  Note: >200kW — consider paralleling modules or custom solution")
+
+        if len(ranked) > 1:
+            alt = ranked[1]
+            lines.append(f"  Alternative: {alt['part_number']} ({alt['manufacturer']}) "
+                         f"@ ${alt.get('price', 0):.2f}")
+
+        return {"text": "\n".join(lines), "top_pick": pn}
+
+    # --- Heatsink Selection ---
+
+    def select_heatsink(self, specs: dict) -> dict:
+        """Select heatsink for power devices.
+
+        Args:
+            specs: Thermal requirements
+                p_loss: float - Total power dissipation [W]
+                rth_jc: float - Junction-case thermal resistance [°C/W]
+                rth_cs: float - Case-sink thermal resistance [°C/W] (default 0.1)
+                tj_max: float - Max junction temperature [°C] (default 175)
+                t_ambient: float - Ambient temperature [°C] (default 40)
+                cooling: str - 'natural', 'forced_air', 'liquid'
+                max_size_mm: tuple - (length, width, height) max dimensions
+
+        Returns:
+            Dict with heatsink candidates and thermal analysis.
+        """
+        p_loss = specs.get("p_loss", 100)
+        rth_jc = specs.get("rth_jc", 0.5)
+        rth_cs = specs.get("rth_cs", 0.1)  # thermal grease/pad
+        tj_max = specs.get("tj_max", 175)
+        t_ambient = specs.get("t_ambient", 40)
+        cooling = specs.get("cooling", "forced_air")
+
+        # Calculate required heatsink thermal resistance
+        rth_sa_required = (tj_max - t_ambient) / p_loss - rth_jc - rth_cs
+        if rth_sa_required <= 0:
+            return {
+                "error": f"Cannot cool {p_loss}W with air: need liquid cooling or lower power",
+                "rth_sa_required": rth_sa_required,
+                "specs": specs,
+                "candidates": [],
+            }
+
+        # Search DigiKey
+        if cooling == "liquid":
+            query = "cold plate liquid cooling"
+        else:
+            query = "heatsink aluminum"
+
+        results = self.dk.keyword_search(query, limit=10)
+        products = results.get("Products", [])
+
+        candidates = []
+        for p in products:
+            params = self._parse_heatsink_params(p.get("Parameters", []))
+
+            # Get appropriate thermal resistance
+            if cooling == "natural":
+                rth = params.get("Rth_natural", params.get("Rth_forced_200", 999))
+            elif cooling == "liquid":
+                rth = params.get("Rth_liquid", params.get("Rth_forced_400", 999))
+            else:
+                rth = params.get("Rth_forced_200", params.get("Rth_natural", 999))
+
+            if rth >= 999:
+                continue
+
+            tj_est = t_ambient + p_loss * (rth + rth_cs + rth_jc)
+            thermal_ok = tj_est < tj_max
+
+            cand = {
+                "part_number": p.get("ManufacturerPartNumber", ""),
+                "manufacturer": p.get("Manufacturer", ""),
+                "price": p.get("UnitPrice", 0),
+                "stock": p.get("QuantityAvailable", 0),
+                "description": p.get("Description", ""),
+                "params": params,
+                "thermal": {
+                    "Rth_SA": rth,
+                    "Rth_SA_required": round(rth_sa_required, 3),
+                    "adequate": rth <= rth_sa_required,
+                    "Tj_estimated_C": round(tj_est, 1),
+                    "Tj_max_C": tj_max,
+                    "margin_C": round(tj_max - tj_est, 1),
+                },
+            }
+            candidates.append(cand)
+
+        candidates.sort(key=lambda c: (
+            not c["thermal"]["adequate"],
+            c["thermal"]["Rth_SA"],
+            c["price"],
+        ))
+
+        return {
+            "specs": specs,
+            "rth_sa_required": round(rth_sa_required, 3),
+            "candidates": candidates,
+            "mock": results.get("_mock", False),
+        }
+
+    def _parse_heatsink_params(self, parameters: list) -> dict:
+        """Parse heatsink parameters from DigiKey API response."""
+        specs = {}
+        for p in parameters:
+            name = p.get("Name", "")
+            value = p.get("Value", "")
+
+            if "Natural Convection" in name or "natural" in name.lower():
+                m = re.search(r"(\d+\.?\d*)\s*°C/W", value)
+                if m:
+                    specs["Rth_natural"] = float(m.group(1))
+
+            elif "200 LFM" in name:
+                m = re.search(r"(\d+\.?\d*)\s*°C/W", value)
+                if m:
+                    specs["Rth_forced_200"] = float(m.group(1))
+
+            elif "400 LFM" in name:
+                m = re.search(r"(\d+\.?\d*)\s*°C/W", value)
+                if m:
+                    specs["Rth_forced_400"] = float(m.group(1))
+
+            elif "1 GPM" in name:
+                m = re.search(r"(\d+\.?\d*)\s*°C/W", value)
+                if m:
+                    specs["Rth_liquid"] = float(m.group(1))
+
+            elif "Length" in name:
+                m = re.search(r"(\d+\.?\d*)\s*mm", value)
+                if m:
+                    specs["length_mm"] = float(m.group(1))
+
+            elif "Width" in name:
+                m = re.search(r"(\d+\.?\d*)\s*mm", value)
+                if m:
+                    specs["width_mm"] = float(m.group(1))
+
+            elif "Height" in name:
+                m = re.search(r"(\d+\.?\d*)\s*mm", value)
+                if m:
+                    specs["height_mm"] = float(m.group(1))
+
+            elif "Type" in name:
+                specs["type"] = value
+
+            elif "Material" in name:
+                specs["material"] = value
+
+        return specs

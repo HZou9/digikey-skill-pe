@@ -230,6 +230,123 @@ def cmd_symbols(args):
         print(json.dumps(result, indent=2))
 
 
+def cmd_power_module(args):
+    """Select power modules for high-power converters."""
+    sel = PowerComponentSelector()
+    specs = {
+        "topology": args.topology,
+        "vin": args.vin,
+        "vout": args.vout,
+        "power": args.power,
+        "fsw": args.fsw,
+        "cooling": args.cooling,
+        "budget": args.budget,
+        "prefer_sic": args.sic if args.sic else None,
+    }
+
+    result = sel.select_power_module(specs)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    mock_tag = " [MOCK DATA]" if result.get("mock") else ""
+    print(f"\n{'='*70}")
+    print(f"Power Module Selection for {args.topology.upper()} Converter{mock_tag}")
+    print(f"  Vin={args.vin}V, Vout={args.vout}V, P={args.power/1000:.0f}kW, "
+          f"Fsw={args.fsw/1e3:.0f}kHz, Cooling={args.cooling}")
+    print(f"  Search query: \"{result.get('query', '')}\"")
+    print(f"{'='*70}\n")
+
+    candidates = result.get("candidates", [])
+    if not candidates:
+        print(f"No candidates found. Error: {result.get('error', 'unknown')}")
+        return
+
+    header = f"{'#':<3} {'Part':<22} {'Mfr':<18} {'Tech':<12} {'V/I':<12} {'RthJC':<8} {'Tj_est':<8} {'$'}"
+    print(header)
+    print("-" * len(header))
+
+    for i, c in enumerate(candidates, 1):
+        p = c.get("params", {})
+        t = c.get("thermal", {})
+        tech = p.get("technology", "?")[:11]
+        vi = f"{p.get('Vces', '?')}V/{p.get('Ic_25C', '?')}A"
+        rth = p.get("RthJC", "?")
+        tj = f"{t.get('Tj_estimated_C', '?')}°C"
+        status = "OK" if t.get("thermal_ok") else "WARN"
+        print(
+            f"{i:<3} {c['part_number']:<22} "
+            f"{c['manufacturer'][:17]:<18} "
+            f"{tech:<12} "
+            f"{vi:<12} "
+            f"{rth:<8} "
+            f"{tj:<8} "
+            f"${c.get('price', 0):.2f}"
+        )
+
+    rec = result.get("recommendation", {})
+    if rec:
+        print(f"\n{'='*70}")
+        print("RECOMMENDATION:")
+        print(rec.get("text", ""))
+        print(f"{'='*70}")
+
+
+def cmd_heatsink(args):
+    """Select heatsink for power devices."""
+    sel = PowerComponentSelector()
+    specs = {
+        "p_loss": args.p_loss,
+        "rth_jc": args.rth_jc,
+        "rth_cs": args.rth_cs,
+        "tj_max": args.tj_max,
+        "t_ambient": args.t_ambient,
+        "cooling": args.cooling,
+    }
+
+    result = sel.select_heatsink(specs)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    mock_tag = " [MOCK DATA]" if result.get("mock") else ""
+    print(f"\n{'='*70}")
+    print(f"Heatsink Selection{mock_tag}")
+    print(f"  P_loss={args.p_loss}W, RthJC={args.rth_jc}°C/W, "
+          f"Tj_max={args.tj_max}°C, Ta={args.t_ambient}°C")
+    print(f"  Required Rth_SA ≤ {result.get('rth_sa_required', '?')} °C/W")
+    print(f"{'='*70}\n")
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return
+
+    candidates = result.get("candidates", [])
+    if not candidates:
+        print("No suitable heatsinks found.")
+        return
+
+    header = f"{'#':<3} {'Part':<28} {'Type':<15} {'Rth_SA':<10} {'Tj_est':<8} {'Margin':<8} {'$'}"
+    print(header)
+    print("-" * len(header))
+
+    for i, c in enumerate(candidates, 1):
+        p = c.get("params", {})
+        t = c.get("thermal", {})
+        hs_type = p.get("type", "?")[:14]
+        ok = "OK" if t.get("adequate") else "INSUF"
+        print(
+            f"{i:<3} {c['part_number']:<28} "
+            f"{hs_type:<15} "
+            f"{t.get('Rth_SA', '?'):<10} "
+            f"{t.get('Tj_estimated_C', '?')}°C{'':<3} "
+            f"{t.get('margin_C', '?')}°C{'':<3} "
+            f"${c.get('price', 0):.2f} [{ok}]"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Power Electronics Component Selection Tool"
@@ -281,6 +398,28 @@ def main():
     sp.add_argument("--altium", action="store_true", help="Altium format")
     sp.add_argument("--batch", help="BOM JSON file for batch download")
 
+    # Power module selection
+    pmp = sub.add_parser("power-module", help="Select power modules for high-power converters")
+    pmp.add_argument("--topology", default="dab", choices=["dab", "llc", "buck", "boost", "full_bridge", "inverter"])
+    pmp.add_argument("--vin", type=float, default=800, help="Input voltage [V]")
+    pmp.add_argument("--vout", type=float, default=400, help="Output voltage [V]")
+    pmp.add_argument("--power", type=float, default=100000, help="Output power [W]")
+    pmp.add_argument("--fsw", type=float, default=20e3, help="Switching frequency [Hz]")
+    pmp.add_argument("--cooling", default="air", choices=["air", "liquid"])
+    pmp.add_argument("--budget", type=float, help="Max price per module [USD]")
+    pmp.add_argument("--sic", action="store_true", help="Prefer SiC over IGBT")
+    pmp.add_argument("--json", action="store_true")
+
+    # Heatsink selection
+    hp = sub.add_parser("heatsink", help="Select heatsink for power devices")
+    hp.add_argument("--p-loss", type=float, default=100, help="Power dissipation [W]")
+    hp.add_argument("--rth-jc", type=float, default=0.5, help="Junction-case thermal resistance [°C/W]")
+    hp.add_argument("--rth-cs", type=float, default=0.1, help="Case-sink thermal resistance [°C/W]")
+    hp.add_argument("--tj-max", type=float, default=175, help="Max junction temperature [°C]")
+    hp.add_argument("--t-ambient", type=float, default=40, help="Ambient temperature [°C]")
+    hp.add_argument("--cooling", default="forced_air", choices=["natural", "forced_air", "liquid"])
+    hp.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -292,6 +431,8 @@ def main():
         "parse": cmd_parse,
         "fom": cmd_fom,
         "symbols": cmd_symbols,
+        "power-module": cmd_power_module,
+        "heatsink": cmd_heatsink,
     }
     cmds[args.command](args)
 
