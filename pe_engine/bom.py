@@ -4,9 +4,10 @@ import io
 import sys
 from pathlib import Path
 
-_dk_root = str(Path(__file__).parent.parent.parent / "digikey-skill")
-if _dk_root not in sys.path:
-    sys.path.insert(0, _dk_root)
+# Ensure repo root is on path for digikey_api import
+_repo_root = str(Path(__file__).parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 from digikey_api.client import DigiKeyClient
 from digikey_api.config import Config as DigiKeyConfig
