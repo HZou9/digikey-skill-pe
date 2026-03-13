@@ -97,20 +97,41 @@ class PowerComponentSelector:
         voltage_tiers = [60, 80, 100, 150, 200, 250, 400, 600, 650, 900, 1000, 1200, 1700]
         voltage = min((v for v in voltage_tiers if v >= v_min_rating), default=1200)
 
-        # Build search query
+        # Build search queries — multiple queries for broader coverage
         template = self.SEARCH_TEMPLATES["mosfet"].get(topology, "MOSFET N-CH {voltage}V")
-        query = template.format(voltage=voltage)
+        base_query = template.format(voltage=voltage)
 
         # Prefer SiC for high voltage + ZVS
-        if voltage >= 600 and zvs and "SiC" not in query:
-            query += " SiC"
+        if voltage >= 600 and zvs and "SiC" not in base_query:
+            base_query += " SiC"
 
-        # Search DigiKey
-        results = self.dk.keyword_search(query, limit=20)
-        products = results.get("Products", [])
+        # Multi-query strategy: cover all major manufacturers
+        queries = [base_query]
+        if voltage >= 600:
+            # Add manufacturer-specific queries for better coverage
+            for mfr_query in [
+                f"CoolSiC {voltage}V MOSFET",
+                f"SCTW SiC {voltage}V MOSFET",
+                f"SCT30 SiC {voltage}V",
+            ]:
+                if mfr_query not in queries:
+                    queries.append(mfr_query)
+
+        # Search DigiKey with all queries and merge results
+        seen_pns = set()
+        products = []
+        is_mock = False
+        for q in queries:
+            results = self.dk.keyword_search(q, limit=20)
+            is_mock = is_mock or results.get("_mock", False)
+            for p in results.get("Products", []):
+                pn = p.get("ManufacturerPartNumber", "")
+                if pn not in seen_pns:
+                    seen_pns.add(pn)
+                    products.append(p)
 
         if not products:
-            return {"error": "No products found", "query": query, "candidates": []}
+            return {"error": "No products found", "query": queries[0], "candidates": []}
 
         # Parse parameters and calculate FOMs
         candidates = []
@@ -139,7 +160,7 @@ class PowerComponentSelector:
             candidates.append(cand)
 
         if not candidates:
-            return {"error": "No candidates with parseable Rds(on)", "query": query, "candidates": []}
+            return {"error": "No candidates with parseable Rds(on)", "query": queries[0], "candidates": []}
 
         # Estimate current for loss calculation
         i_rms = power / (v_primary * 0.9)  # rough estimate
@@ -164,11 +185,12 @@ class PowerComponentSelector:
         recommendation = self._generate_recommendation(ranked, specs, n_devices)
 
         return {
-            "query": query,
+            "query": queries[0],
+            "queries_used": queries,
             "specs": specs,
             "candidates": ranked,
             "recommendation": recommendation,
-            "mock": results.get("_mock", False),
+            "mock": is_mock,
         }
 
     def select_gate_driver(self, mosfet_params: dict, topology: str = "dab",
