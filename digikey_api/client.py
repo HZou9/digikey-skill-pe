@@ -155,7 +155,9 @@ class DigiKeyClient:
             body["FilterOptionsRequest"] = {"InStock": True}
 
         cache_key = Cache.make_key("keyword_search", body)
-        return self._api_request("POST", self.config.search_url(), body, cache_key)
+        data = self._api_request("POST", self.config.search_url(), body, cache_key)
+        data["Products"] = [self._normalize_product(p) for p in data.get("Products", [])]
+        return data
 
     def product_details(self, digikey_part_number: str) -> dict:
         """Get detailed product information.
@@ -171,7 +173,10 @@ class DigiKeyClient:
 
         url = self.config.details_url(digikey_part_number)
         cache_key = Cache.make_key("details", {"pn": digikey_part_number})
-        return self._api_request("GET", url, cache_key=cache_key)
+        data = self._api_request("GET", url, cache_key=cache_key)
+        if "Product" in data:
+            data["Product"] = self._normalize_product(data["Product"])
+        return data
 
     def get_pricing(self, digikey_part_number: str) -> dict:
         """Get pricing tiers for a product.
@@ -204,6 +209,63 @@ class DigiKeyClient:
         url = self.config.substitutions_url(digikey_part_number)
         cache_key = Cache.make_key("subs", {"pn": digikey_part_number})
         return self._api_request("GET", url, cache_key=cache_key)
+
+    # --- Response normalization ---
+
+    @staticmethod
+    def _normalize_product(p: dict) -> dict:
+        """Normalize real API response fields to match mock data format.
+
+        Real API uses ManufacturerProductNumber, ParameterText/ValueText, etc.
+        Mock data uses ManufacturerPartNumber, Name/Value, etc.
+        This ensures downstream code works with both.
+        """
+        # Already normalized (mock data) — skip
+        if "ManufacturerPartNumber" in p and isinstance(p.get("Description", ""), str):
+            return p
+
+        # ManufacturerProductNumber → ManufacturerPartNumber
+        if "ManufacturerProductNumber" in p and "ManufacturerPartNumber" not in p:
+            p["ManufacturerPartNumber"] = p["ManufacturerProductNumber"]
+
+        # Manufacturer dict → string
+        mfr = p.get("Manufacturer")
+        if isinstance(mfr, dict):
+            p["Manufacturer"] = mfr.get("Name", str(mfr))
+
+        # Description dict → string
+        desc = p.get("Description")
+        if isinstance(desc, dict):
+            p["Description"] = desc.get("DetailedDescription",
+                                        desc.get("ProductDescription", ""))
+
+        # DigiKeyPartNumber from ProductVariations
+        if "DigiKeyPartNumber" not in p:
+            variations = p.get("ProductVariations", [])
+            if variations:
+                # Prefer Cut Tape or first available
+                for v in variations:
+                    pkg = v.get("PackageType", {}).get("Name", "")
+                    if "Cut Tape" in pkg or "Through Hole" in pkg:
+                        p["DigiKeyPartNumber"] = v["DigiKeyProductNumber"]
+                        break
+                if "DigiKeyPartNumber" not in p:
+                    p["DigiKeyPartNumber"] = variations[0].get("DigiKeyProductNumber", "")
+
+        # Parameters: ParameterText/ValueText → Name/Value
+        params = p.get("Parameters", [])
+        normalized_params = []
+        for param in params:
+            if "ParameterText" in param:
+                normalized_params.append({
+                    "Name": param["ParameterText"],
+                    "Value": param["ValueText"],
+                })
+            else:
+                normalized_params.append(param)
+        p["Parameters"] = normalized_params
+
+        return p
 
     def download_datasheet(self, url: str, save_path: str) -> str:
         """Download a datasheet PDF.

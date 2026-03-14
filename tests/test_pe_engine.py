@@ -3,6 +3,9 @@ import pytest
 import os
 from pathlib import Path
 
+# Force mock mode for all tests (don't hit real API even if credentials exist)
+os.environ["DIGIKEY_MOCK_MODE"] = "true"
+
 # Ensure pe_engine is importable
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))

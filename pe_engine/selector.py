@@ -105,20 +105,25 @@ class PowerComponentSelector:
         if voltage >= 600 and zvs and "SiC" not in base_query:
             base_query += " SiC"
 
-        # Multi-query strategy: cover all major manufacturers
+        # Multi-query strategy: cover all major manufacturers and nearby voltage tiers
         queries = [base_query]
         if voltage >= 600:
-            # Add manufacturer-specific queries for better coverage
-            for mfr_query in [
-                f"CoolSiC {voltage}V MOSFET",
-                f"SCTW SiC {voltage}V MOSFET",
-                f"SCT30 SiC {voltage}V",
-            ]:
-                if mfr_query not in queries:
-                    queries.append(mfr_query)
+            # Also search the next voltage tier (e.g., 600→650)
+            idx = voltage_tiers.index(voltage) if voltage in voltage_tiers else -1
+            nearby_voltages = [voltage]
+            if idx >= 0 and idx + 1 < len(voltage_tiers):
+                nearby_voltages.append(voltage_tiers[idx + 1])
+
+            for v in nearby_voltages:
+                for mfr_query in [
+                    f"SiC MOSFET {v}V",
+                    f"CoolSiC {v}V MOSFET",
+                ]:
+                    if mfr_query not in queries:
+                        queries.append(mfr_query)
 
         # Search DigiKey with all queries and merge results
-        seen_pns = set()
+        seen_base_pns = set()
         products = []
         is_mock = False
         for q in queries:
@@ -126,8 +131,10 @@ class PowerComponentSelector:
             is_mock = is_mock or results.get("_mock", False)
             for p in results.get("Products", []):
                 pn = p.get("ManufacturerPartNumber", "")
-                if pn not in seen_pns:
-                    seen_pns.add(pn)
+                # Deduplicate packaging variants (-TR, -CT, -DKR suffixes)
+                base_pn = re.sub(r'[-]?(TR|CT|DKR|TND|XTMA1)$', '', pn)
+                if base_pn not in seen_base_pns:
+                    seen_base_pns.add(base_pn)
                     products.append(p)
 
         if not products:
@@ -141,6 +148,11 @@ class PowerComponentSelector:
             params = parse_from_digikey_params(p.get("Parameters", []))
             if not params.get("Rds_on"):
                 continue  # Skip if can't get Rds(on)
+
+            # Voltage class filter: skip devices with Vds > 2x required voltage
+            vds = params.get("Vds_max")
+            if vds and vds > v_required * 2:
+                continue
 
             # Budget filter
             price = p.get("UnitPrice", 0)
