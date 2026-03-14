@@ -302,15 +302,43 @@ class SymbolFetcher:
 
     # --- Backend 2: easyeda2kicad (LCSC/EasyEDA) ---
 
-    def _fetch_easyeda(self, part_number: str) -> dict:
-        """Fetch KiCad symbols via easyeda2kicad CLI tool.
+    @staticmethod
+    def _mpn_to_lcsc_id(mpn: str) -> str | None:
+        """Look up LCSC ID from manufacturer part number via JLCPCB API."""
+        try:
+            resp = requests.post(
+                "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart"
+                "/smtGood/selectSmtComponentList",
+                json={"keyword": mpn, "pageSize": 5, "currentPage": 1},
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            products = (data.get("data", {})
+                        .get("componentPageInfo", {})
+                        .get("list", []))
+            # Find exact MPN match
+            for p in products:
+                if p.get("componentModelEn", "").upper() == mpn.upper():
+                    return p.get("componentCode")
+            # Fall back to first result
+            if products:
+                return products[0].get("componentCode")
+        except Exception as e:
+            logger.warning("LCSC ID lookup failed for %s: %s", mpn, e)
+        return None
 
-        This uses the LCSC/EasyEDA component library which has 2M+ parts.
+    def _fetch_easyeda(self, part_number: str) -> dict:
+        """Fetch KiCad symbols via easyeda2kicad + JLCPCB/LCSC lookup.
+
+        Flow: MPN → JLCPCB API → LCSC ID → easyeda2kicad → KiCad files.
         No API key required. KiCad format only.
         """
         # Check if easyeda2kicad is installed
         if not shutil.which("easyeda2kicad"):
-            # Try running as python module
             try:
                 result = subprocess.run(
                     ["python3", "-m", "easyeda2kicad", "--help"],
@@ -327,37 +355,55 @@ class SymbolFetcher:
                     "reason": "easyeda2kicad not installed. Run: pip install easyeda2kicad",
                 }
 
+        # Resolve LCSC ID: accept either LCSC ID (C...) or MPN
+        if part_number.startswith("C") and part_number[1:].isdigit():
+            lcsc_id = part_number
+        else:
+            lcsc_id = self._mpn_to_lcsc_id(part_number)
+            if not lcsc_id:
+                return {
+                    "success": False,
+                    "reason": f"Part {part_number} not found on LCSC/JLCPCB",
+                }
+            logger.info("Resolved %s → LCSC %s", part_number, lcsc_id)
+
         save_dir = self.output_dir / part_number / "kicad9"
         save_dir.mkdir(parents=True, exist_ok=True)
+        output_base = str(save_dir / part_number)
 
         try:
-            # easyeda2kicad --full --lcsc_id <ID> --output <dir>
-            # It can also accept MPN directly
             cmd = [
                 "python3", "-m", "easyeda2kicad",
-                "--full",
-                "--lcsc_id", part_number,
-                "--output", str(save_dir / part_number),
+                "--symbol", "--footprint",
+                "--lcsc_id", lcsc_id,
+                "--output", output_base,
             ]
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=60,
             )
 
-            if result.returncode == 0:
-                # List generated files
-                files = [f.name for f in save_dir.iterdir() if f.is_file()]
-                if files:
-                    return {
-                        "success": True,
-                        "source": "EasyEDA/LCSC",
-                        "format": "kicad9",
-                        "files": files,
-                        "directory": str(save_dir),
-                    }
+            # Collect generated files
+            files = []
+            sym_file = Path(f"{output_base}.kicad_sym")
+            fp_dir = Path(f"{output_base}.pretty")
+            if sym_file.exists():
+                files.append(sym_file.name)
+            if fp_dir.exists():
+                files.extend(f.name for f in fp_dir.iterdir() if f.is_file())
+
+            if files:
+                return {
+                    "success": True,
+                    "source": "EasyEDA/LCSC",
+                    "lcsc_id": lcsc_id,
+                    "format": "kicad9",
+                    "files": files,
+                    "directory": str(save_dir),
+                }
 
             return {
                 "success": False,
-                "reason": f"easyeda2kicad failed: {result.stderr[:200]}",
+                "reason": f"easyeda2kicad produced no files: {result.stderr[:200]}",
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "reason": "easyeda2kicad timed out"}
