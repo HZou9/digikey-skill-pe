@@ -218,30 +218,42 @@ class PowerComponentSelector:
             if "isolated" not in query:
                 query += " isolated"
 
-        # Multi-query for broader vendor coverage
+        # Multi-query: parametric searches at different current levels
+        # to naturally cover different vendors and price points
         io_a = int(reqs.recommended_current_A)
-        queries = [
-            query,
-            f"gate driver {io_a}A isolated",
-            "UCC215 gate driver",         # TI
-            "ADuM4 gate driver",          # ADI
-            "SI827 gate driver",          # Skyworks
-            "STGAP gate driver",          # ST
-        ]
+        is_isolated = "isolated" in query or topology in ("dab", "llc", "cllc", "full_bridge")
+        iso_kw = "isolated" if is_isolated else ""
 
-        # Search and merge results
-        seen_pns = set()
+        queries = [query]
+        # Search at the recommended current and nearby tiers
+        for io_tier in sorted(set([io_a, io_a + 2, max(4, io_a - 2), 10])):
+            q = f"gate driver {iso_kw} {io_tier}A".strip()
+            if q not in queries:
+                queries.append(q)
+        # Half-bridge specific query
+        if topology in ("dab", "full_bridge", "npc", "t_type"):
+            queries.append(f"gate driver half bridge {io_a}A")
+        # SiC-specific drivers
+        if mosfet_params.get("technology") == "SiC":
+            queries.append(f"gate driver SiC {iso_kw}".strip())
+
+        # Search and merge results, dedup packaging variants
+        seen_base_pns = set()
         products = []
+        is_mock = False
         for q in queries:
             results = self.dk.keyword_search(q, limit=15)
+            is_mock = is_mock or results.get("_mock", False)
             for p in results.get("Products", []):
                 pn = p.get("ManufacturerPartNumber", "")
-                # Skip eval boards, modules, dev kits
                 desc = p.get("Description", "").lower()
+                # Skip eval boards, modules, dev kits
                 if any(skip in desc for skip in ["eval", "development", "demo", "module", "board"]):
                     continue
-                if pn not in seen_pns:
-                    seen_pns.add(pn)
+                # Deduplicate packaging variants
+                base_pn = re.sub(r'[-]?(TR|CT|DKR|TND|RL)$', '', pn)
+                if base_pn not in seen_base_pns:
+                    seen_base_pns.add(base_pn)
                     products.append(p)
 
         candidates = []
@@ -260,7 +272,10 @@ class PowerComponentSelector:
                 "requirements_met": score >= 0.6,
             })
 
+        # Sort by score, then diversify: interleave vendors so no single
+        # vendor dominates the top of the list
         candidates.sort(key=lambda c: -c["compatibility_score"])
+        diversified = self._diversify_by_vendor(candidates)
 
         return {
             "mosfet_requirements": {
@@ -271,8 +286,8 @@ class PowerComponentSelector:
                 "recommended_vcc": reqs.recommended_vcc,
                 "notes": reqs.notes,
             },
-            "candidates": candidates,
-            "mock": results.get("_mock", False),
+            "candidates": diversified,
+            "mock": is_mock,
         }
 
     def _score_gate_driver(self, driver_params: dict, reqs: GateDriverReqs) -> float:
@@ -299,6 +314,35 @@ class PowerComponentSelector:
             score += 0.05
 
         return min(1.0, score)
+
+    @staticmethod
+    def _diversify_by_vendor(candidates: list, max_per_vendor: int = 5) -> list:
+        """Reorder candidates to interleave vendors for balanced comparison.
+
+        Takes top max_per_vendor from each vendor, then round-robin interleaves
+        them so users see options from different manufacturers.
+        """
+        from collections import defaultdict
+        by_vendor = defaultdict(list)
+        for c in candidates:
+            mfr = c.get("manufacturer", "Unknown")
+            if len(by_vendor[mfr]) < max_per_vendor:
+                by_vendor[mfr].append(c)
+
+        # Round-robin interleave: take one from each vendor in turn
+        result = []
+        vendor_iters = {mfr: iter(parts) for mfr, parts in by_vendor.items()}
+        while vendor_iters:
+            exhausted = []
+            for mfr, it in vendor_iters.items():
+                try:
+                    result.append(next(it))
+                except StopIteration:
+                    exhausted.append(mfr)
+            for mfr in exhausted:
+                del vendor_iters[mfr]
+
+        return result
 
     def _generate_recommendation(self, ranked: list, specs: dict,
                                  n_devices: int) -> dict:
