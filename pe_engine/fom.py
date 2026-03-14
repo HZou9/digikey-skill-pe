@@ -100,12 +100,15 @@ class FOMCalculator:
     def estimate_losses(self, params: dict, op: dict) -> LossEstimate:
         """Estimate power losses at a given operating point.
 
+        NOTE: This is a simplified estimate. Actual losses depend on topology,
+        modulation, dead time, parasitics, etc. Use this only as a rough
+        reference — users should calculate losses for their specific application.
+
         Args:
             params: MOSFET parameters dict
-                Rds_on: mΩ, Qg: nC, Eoss: µJ, Vsd: V, trr: ns, Qrr: nC
+                Rds_on: mΩ, Qg: nC, Eoss: µJ, Vsd: V, trr: ns
             op: Operating point dict
-                i_rms: A, vgs: V, fsw: Hz, duty: float (0-1),
-                power: W (for efficiency calc), i_peak: A (optional)
+                i_rms: A, vgs: V, fsw: Hz, duty: float, power: W
 
         Returns:
             LossEstimate with breakdown.
@@ -116,50 +119,44 @@ class FOMCalculator:
         i_rms = op.get("i_rms", 0)
         fsw = op.get("fsw", 100e3)
         vgs = op.get("vgs", 15)
-        duty = op.get("duty", 0.5)
         power = op.get("power", 0)
 
-        # Conduction loss: I²rms × Rds(on)
         loss.P_cond = i_rms ** 2 * rds
-
-        # Gate drive loss: Qg × Vgs × Fsw
-        qg = params.get("Qg", 0) * 1e-9  # C
+        qg = params.get("Qg", 0) * 1e-9
         loss.P_gate = qg * vgs * fsw
 
-        # Switching loss
         eoss = params.get("Eoss")
         if eoss is not None:
-            loss.P_sw = eoss * 1e-6 * fsw  # Eoss × Fsw
+            loss.P_sw = eoss * 1e-6 * fsw
         else:
-            # Approximate from Qg
             loss.P_sw = 0.5 * qg * vgs * fsw
 
-        # Body diode conduction (simplified)
-        vsd = params.get("Vsd", 0.7)  # V
-        trr = params.get("trr", 0)  # ns
+        vsd = params.get("Vsd", 0.7)
+        trr = params.get("trr", 0)
         i_peak = op.get("i_peak", i_rms)
         if trr > 0:
             loss.P_body_diode = vsd * i_peak * trr * 1e-9 * fsw
 
         loss.P_total = loss.P_cond + loss.P_sw + loss.P_gate + loss.P_body_diode
-
         if power > 0:
-            loss.eta_impact = (loss.P_total / power) * 100  # % of power
+            loss.eta_impact = (loss.P_total / power) * 100
 
         return loss
 
-    def rank_candidates(self, candidates: list, topology: str = "dab",
-                        operating_point: dict | None = None) -> list:
+    def rank_candidates(self, candidates: list, topology: str = "dab") -> list:
         """Rank MOSFET candidates by weighted FOM score.
+
+        Provides FOM-based ranking as a reference. Loss calculation and final
+        device selection should be done by the user based on their specific
+        topology, modulation, and operating conditions.
 
         Args:
             candidates: List of dicts, each with 'params' and optional 'price',
                         'part_number', 'manufacturer'.
             topology: Converter topology for FOM weighting.
-            operating_point: Optional op point for loss estimation.
 
         Returns:
-            Sorted list with FOMs, losses, and composite score.
+            Sorted list with FOMs and composite score (lower = better FOM).
         """
         weights = self.TOPOLOGY_WEIGHTS.get(topology, self.TOPOLOGY_WEIGHTS["dab"])
         results = []
@@ -191,18 +188,9 @@ class FOMCalculator:
                 score_parts += weights["rds_coss"]
 
             result["composite_score"] = score / score_parts if score_parts > 0 else float("inf")
-
-            if operating_point:
-                result["losses"] = self.estimate_losses(params, operating_point)
-
             results.append(result)
 
-        # When operating point is given, rank by estimated total loss (most accurate).
-        # Otherwise fall back to FOM-based composite score.
-        if operating_point:
-            results.sort(key=lambda r: r["losses"].P_total)
-        else:
-            results.sort(key=lambda r: r["composite_score"])
+        results.sort(key=lambda r: r["composite_score"])
         return results
 
     def gate_driver_requirements(self, params: dict, fsw: float = 100e3) -> GateDriverReqs:

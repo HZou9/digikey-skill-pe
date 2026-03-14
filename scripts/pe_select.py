@@ -74,18 +74,6 @@ def cmd_mosfet(args):
             f"{c.get('composite_score', 0):.0f}"
         )
 
-    # Loss estimates
-    if candidates[0].get("losses"):
-        print(f"\nLoss Estimates (@ Fsw={args.fsw/1e3:.0f}kHz):")
-        for i, c in enumerate(candidates[:3], 1):
-            l = c.get("losses")
-            if l:
-                print(
-                    f"  {i}. {c['part_number']}: "
-                    f"P_cond={l.P_cond:.1f}W, P_sw={l.P_sw:.1f}W, "
-                    f"P_gate={l.P_gate:.2f}W → Total={l.P_total:.1f}W"
-                )
-
     # Voltage derating
     print(f"\nVoltage Derating Check:")
     for c in candidates[:3]:

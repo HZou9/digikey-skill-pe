@@ -174,18 +174,8 @@ class PowerComponentSelector:
         if not candidates:
             return {"error": "No candidates with parseable Rds(on)", "query": queries[0], "candidates": []}
 
-        # Estimate current for loss calculation
-        i_rms = power / (v_primary * 0.9)  # rough estimate
-        op = {
-            "i_rms": i_rms,
-            "vgs": 18 if voltage >= 600 else 10,
-            "fsw": fsw_val,
-            "duty": 0.5,
-            "power": power,
-        }
-
-        # Rank by FOM
-        ranked = self.fom.rank_candidates(candidates, topology, op)
+        # Rank by FOM (loss calculation left to user for their specific application)
+        ranked = self.fom.rank_candidates(candidates, topology)
 
         # Add voltage derating check
         for r in ranked:
@@ -309,10 +299,7 @@ class PowerComponentSelector:
         if top["foms"].rds_qoss is not None:
             lines.append(f"  FOM Rds×Qoss: {top['foms'].rds_qoss:.0f} mΩ·nC")
 
-        if top.get("losses"):
-            l = top["losses"]
-            lines.append(f"  Est. losses: {l.P_total:.1f}W (cond={l.P_cond:.1f}, sw={l.P_sw:.1f}, gate={l.P_gate:.2f})")
-
+        lines.append(f"  Qg: {top['params'].get('Qg', '?')} nC")
         lines.append(f"  Price: ${price:.2f}/pc × {n_devices} = ${total_cost:.2f}")
 
         if len(ranked) > 1:
