@@ -197,7 +197,12 @@ class FOMCalculator:
 
             results.append(result)
 
-        results.sort(key=lambda r: r["composite_score"])
+        # When operating point is given, rank by estimated total loss (most accurate).
+        # Otherwise fall back to FOM-based composite score.
+        if operating_point:
+            results.sort(key=lambda r: r["losses"].P_total)
+        else:
+            results.sort(key=lambda r: r["composite_score"])
         return results
 
     def gate_driver_requirements(self, params: dict, fsw: float = 100e3) -> GateDriverReqs:
