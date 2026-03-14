@@ -218,11 +218,16 @@ class PowerComponentSelector:
             if "isolated" not in query:
                 query += " isolated"
 
-        # Multi-query for broader gate driver coverage
-        queries = [query]
-        if mosfet_params.get("technology") == "SiC":
-            # Add SiC-specific driver queries (high CMTI, high Io)
-            queries.append(f"gate driver {int(reqs.recommended_current_A)}A isolated")
+        # Multi-query for broader vendor coverage
+        io_a = int(reqs.recommended_current_A)
+        queries = [
+            query,
+            f"gate driver {io_a}A isolated",
+            "UCC215 gate driver",         # TI
+            "ADuM4 gate driver",          # ADI
+            "SI827 gate driver",          # Skyworks
+            "STGAP gate driver",          # ST
+        ]
 
         # Search and merge results
         seen_pns = set()

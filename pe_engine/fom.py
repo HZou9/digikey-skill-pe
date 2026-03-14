@@ -233,8 +233,8 @@ class FOMCalculator:
 
         # Notes
         if is_sic:
-            reqs.notes.append("SiC MOSFET: use Vcc=18V for lowest Rds(on)")
-            reqs.notes.append("Negative turn-off voltage (-2V to -5V) recommended for SiC")
+            reqs.notes.append("SiC MOSFET: Vcc=18V typical for lowest Rds(on)")
+            reqs.notes.append("SiC turn-off options: -5V/-2V (negative rail), 0V (with active Miller clamp)")
         if qg > 150:
             reqs.notes.append(f"High Qg ({qg}nC): ensure driver peak current > {reqs.min_peak_current_A:.1f}A")
         if fsw > 200e3:
