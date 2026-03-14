@@ -209,7 +209,7 @@ class PowerComponentSelector:
         """
         reqs = self.fom.gate_driver_requirements(mosfet_params, fsw)
 
-        # Build search query
+        # Build search queries
         template = self.SEARCH_TEMPLATES["gate_driver"].get(topology, "gate driver isolated")
         query = template
 
@@ -218,8 +218,26 @@ class PowerComponentSelector:
             if "isolated" not in query:
                 query += " isolated"
 
-        results = self.dk.keyword_search(query, limit=10)
-        products = results.get("Products", [])
+        # Multi-query for broader gate driver coverage
+        queries = [query]
+        if mosfet_params.get("technology") == "SiC":
+            # Add SiC-specific driver queries (high CMTI, high Io)
+            queries.append(f"gate driver {int(reqs.recommended_current_A)}A isolated")
+
+        # Search and merge results
+        seen_pns = set()
+        products = []
+        for q in queries:
+            results = self.dk.keyword_search(q, limit=15)
+            for p in results.get("Products", []):
+                pn = p.get("ManufacturerPartNumber", "")
+                # Skip eval boards, modules, dev kits
+                desc = p.get("Description", "").lower()
+                if any(skip in desc for skip in ["eval", "development", "demo", "module", "board"]):
+                    continue
+                if pn not in seen_pns:
+                    seen_pns.add(pn)
+                    products.append(p)
 
         candidates = []
         for p in products:

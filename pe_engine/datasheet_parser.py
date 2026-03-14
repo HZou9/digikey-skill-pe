@@ -824,13 +824,19 @@ def parse_from_digikey_params(parameters: list) -> dict:
             specs["fet_type"] = value
 
         # Gate driver specific
-        elif "Peak Output Current" in name:
+        elif "Peak Output Current" in name or "Peak Output" in name:
             m = re.findall(r"(\d+\.?\d*)\s*A", value)
             if len(m) >= 2:
                 specs["Io_source"] = float(m[0])
                 specs["Io_sink"] = float(m[1])
             elif m:
                 specs["Io_source"] = float(m[0])
+
+        elif "Output High, Low" in name or "Output High" in name:
+            m = re.findall(r"(\d+\.?\d*)\s*A", value)
+            if len(m) >= 2:
+                specs.setdefault("Io_source", float(m[0]))
+                specs.setdefault("Io_sink", float(m[1]))
 
         elif "Propagation Delay" in name:
             m = re.search(r"(\d+\.?\d*)\s*(ns|µs)", value)
