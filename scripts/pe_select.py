@@ -480,6 +480,7 @@ def cmd_capacitor(args):
     result = sel.select_capacitor({
         "cap_type": args.cap_type,
         "voltage": args.voltage,
+        "capacitance": args.capacitance,
         "budget": args.budget,
     })
 
@@ -703,6 +704,7 @@ def main():
                     choices=["dc_link", "resonant", "filter", "emi_x", "emi_y",
                              "snubber", "bootstrap"])
     cp.add_argument("--voltage", type=float, default=400, help="Voltage rating [V]")
+    cp.add_argument("--capacitance", default="", help="Target capacitance (e.g., 10uF, 100nF)")
     cp.add_argument("--budget", type=float, help="Max price [USD]")
     cp.add_argument("--json", action="store_true")
 

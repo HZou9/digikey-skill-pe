@@ -744,17 +744,17 @@ class PowerComponentSelector:
 
     CAPACITOR_QUERIES = {
         "dc_link": [
-            "film capacitor {voltage}V",
-            "aluminum electrolytic capacitor {voltage}V",
-            "polypropylene capacitor {voltage}V",
+            "film capacitor {voltage}",
+            "aluminum electrolytic capacitor {voltage}",
+            "polypropylene capacitor {voltage}",
         ],
         "resonant": [
-            "film capacitor {voltage}V polypropylene",
-            "mica capacitor {voltage}V",
+            "film capacitor {voltage} polypropylene",
+            "mica capacitor {voltage}",
         ],
         "filter": [
-            "MLCC ceramic capacitor {voltage}V",
-            "film capacitor {voltage}V",
+            "MLCC ceramic capacitor {voltage}",
+            "film capacitor {voltage}",
         ],
         "emi_x": [
             "X2 safety capacitor",
@@ -765,8 +765,8 @@ class PowerComponentSelector:
             "Y1 safety capacitor",
         ],
         "snubber": [
-            "film capacitor {voltage}V polypropylene snubber",
-            "ceramic capacitor C0G {voltage}V",
+            "film capacitor {voltage} polypropylene snubber",
+            "ceramic capacitor C0G {voltage}",
         ],
         "bootstrap": [
             "MLCC ceramic capacitor 25V",
@@ -781,7 +781,7 @@ class PowerComponentSelector:
             specs: Dict with keys:
                 cap_type: dc_link|resonant|filter|emi_x|emi_y|snubber|bootstrap
                 voltage: Required voltage rating [V]
-                capacitance: Target capacitance (optional, for display)
+                capacitance: Target capacitance string (e.g., "10uF", optional)
                 budget: Max price (optional)
 
         Returns:
@@ -789,10 +789,21 @@ class PowerComponentSelector:
         """
         cap_type = specs.get("cap_type", "dc_link")
         voltage = specs.get("voltage", 400)
+        capacitance = specs.get("capacitance", "")
         budget = specs.get("budget")
 
+        # Format voltage: use kV for >= 1000V (DigiKey search works better)
+        if voltage >= 1000:
+            v_str = f"{voltage / 1000:.0f}kV" if voltage % 1000 == 0 else f"{voltage / 1000:.1f}kV"
+        else:
+            v_str = f"{int(voltage)}V"
+
         templates = self.CAPACITOR_QUERIES.get(cap_type, self.CAPACITOR_QUERIES["dc_link"])
-        queries = [t.format(voltage=voltage) for t in templates]
+        queries = [t.format(voltage=v_str) for t in templates]
+
+        # Append capacitance to queries if specified
+        if capacitance:
+            queries = [f"{q} {capacitance}" for q in queries]
 
         seen_base_pns = set()
         products = []
@@ -841,7 +852,7 @@ class PowerComponentSelector:
             value = p.get("Value", "")
             if "Capacitance" in name and "Tolerance" not in name:
                 specs["capacitance"] = value
-            elif "Voltage" in name and "Rated" in name:
+            elif "Voltage" in name and ("Rated" in name or "Rating" in name):
                 m = re.search(r"(\d+\.?\d*)\s*(V|kV)", value)
                 if m:
                     v = float(m.group(1))
