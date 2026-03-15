@@ -737,3 +737,372 @@ class PowerComponentSelector:
                 specs["material"] = value
 
         return specs
+
+    # ================================================================
+    # Capacitor Selection
+    # ================================================================
+
+    CAPACITOR_QUERIES = {
+        "dc_link": [
+            "film capacitor {voltage}V",
+            "aluminum electrolytic capacitor {voltage}V",
+            "polypropylene capacitor {voltage}V",
+        ],
+        "resonant": [
+            "film capacitor {voltage}V polypropylene",
+            "mica capacitor {voltage}V",
+        ],
+        "filter": [
+            "MLCC ceramic capacitor {voltage}V",
+            "film capacitor {voltage}V",
+        ],
+        "emi_x": [
+            "X2 safety capacitor",
+            "X1 safety capacitor",
+        ],
+        "emi_y": [
+            "Y2 safety capacitor",
+            "Y1 safety capacitor",
+        ],
+        "snubber": [
+            "film capacitor {voltage}V polypropylene snubber",
+            "ceramic capacitor C0G {voltage}V",
+        ],
+        "bootstrap": [
+            "MLCC ceramic capacitor 25V",
+            "MLCC ceramic capacitor 50V",
+        ],
+    }
+
+    def select_capacitor(self, specs: dict) -> dict:
+        """Search capacitors for power electronics applications.
+
+        Args:
+            specs: Dict with keys:
+                cap_type: dc_link|resonant|filter|emi_x|emi_y|snubber|bootstrap
+                voltage: Required voltage rating [V]
+                capacitance: Target capacitance (optional, for display)
+                budget: Max price (optional)
+
+        Returns:
+            Dict with search results and parameters.
+        """
+        cap_type = specs.get("cap_type", "dc_link")
+        voltage = specs.get("voltage", 400)
+        budget = specs.get("budget")
+
+        templates = self.CAPACITOR_QUERIES.get(cap_type, self.CAPACITOR_QUERIES["dc_link"])
+        queries = [t.format(voltage=voltage) for t in templates]
+
+        seen_base_pns = set()
+        products = []
+        is_mock = False
+        for q in queries:
+            results = self.dk.keyword_search(q, limit=20)
+            is_mock = is_mock or results.get("_mock", False)
+            for p in results.get("Products", []):
+                pn = p.get("ManufacturerPartNumber", "")
+                base_pn = re.sub(r'[-]?(TR|CT|DKR)$', '', pn)
+                desc = p.get("Description", "").lower()
+                if any(skip in desc for skip in ["eval", "kit", "board"]):
+                    continue
+                if base_pn not in seen_base_pns:
+                    seen_base_pns.add(base_pn)
+                    products.append(p)
+
+        candidates = []
+        for p in products:
+            params = self._parse_capacitor_params(p.get("Parameters", []))
+            price = p.get("UnitPrice", 0)
+            if budget and price > budget:
+                continue
+            candidates.append({
+                "part_number": p.get("ManufacturerPartNumber", ""),
+                "manufacturer": p.get("Manufacturer", ""),
+                "price": price,
+                "stock": p.get("QuantityAvailable", 0),
+                "datasheet": p.get("DatasheetUrl", ""),
+                "description": p.get("Description", ""),
+                "params": params,
+            })
+
+        return {
+            "cap_type": cap_type,
+            "voltage": voltage,
+            "candidates": self._diversify_by_vendor(candidates),
+            "mock": is_mock,
+        }
+
+    @staticmethod
+    def _parse_capacitor_params(parameters: list) -> dict:
+        specs = {}
+        for p in parameters:
+            name = p.get("Name", "")
+            value = p.get("Value", "")
+            if "Capacitance" in name and "Tolerance" not in name:
+                specs["capacitance"] = value
+            elif "Voltage" in name and "Rated" in name:
+                m = re.search(r"(\d+\.?\d*)\s*(V|kV)", value)
+                if m:
+                    v = float(m.group(1))
+                    specs["voltage_rated"] = v * 1000 if m.group(2) == "kV" else v
+                specs["voltage_rated_str"] = value
+            elif "Temperature Coefficient" in name or "Dielectric" in name:
+                specs["dielectric"] = value
+            elif "Tolerance" in name:
+                specs["tolerance"] = value
+            elif "ESR" in name:
+                specs["esr"] = value
+            elif "Ripple Current" in name:
+                specs["ripple_current"] = value
+            elif "Lifetime" in name:
+                specs["lifetime"] = value
+            elif "Package" in name or "Case" in name:
+                specs["package"] = value
+            elif "Mounting" in name:
+                specs["mounting"] = value
+        return specs
+
+    # ================================================================
+    # Magnetics Selection
+    # ================================================================
+
+    MAGNETICS_QUERIES = {
+        "ferrite_core": [
+            "ferrite core E",
+            "ferrite core PQ",
+            "ferrite core toroidal",
+            "ferrite core RM",
+            "ferrite core ETD",
+        ],
+        "nanocrystalline": [
+            "nanocrystalline toroidal core",
+            "amorphous core toroidal",
+        ],
+        "inductor": [
+            "power inductor {current}A",
+            "inductor shielded {current}A",
+        ],
+        "pfc_inductor": [
+            "PFC inductor",
+            "PFC choke",
+            "boost inductor {current}A",
+        ],
+        "transformer": [
+            "gate drive transformer",
+            "pulse transformer",
+            "power transformer",
+        ],
+        "bobbin": [
+            "bobbin E core",
+            "bobbin PQ",
+            "bobbin ETD",
+            "coil former",
+        ],
+        "cmc": [
+            "common mode choke {current}A",
+            "common mode filter {current}A",
+        ],
+        "emi_filter": [
+            "EMI filter {current}A",
+            "line filter {current}A",
+            "AC EMI filter",
+        ],
+    }
+
+    def select_magnetics(self, specs: dict) -> dict:
+        """Search magnetic components for power electronics.
+
+        Args:
+            specs: Dict with keys:
+                mag_type: ferrite_core|nanocrystalline|inductor|pfc_inductor|
+                          transformer|bobbin|cmc|emi_filter
+                current: Rated current [A] (for inductors/chokes)
+                inductance: Target inductance (optional, for display)
+                budget: Max price (optional)
+
+        Returns:
+            Dict with search results.
+        """
+        mag_type = specs.get("mag_type", "ferrite_core")
+        current = specs.get("current", 10)
+        budget = specs.get("budget")
+
+        templates = self.MAGNETICS_QUERIES.get(mag_type, self.MAGNETICS_QUERIES["ferrite_core"])
+        queries = [t.format(current=int(current)) for t in templates]
+
+        seen_base_pns = set()
+        products = []
+        is_mock = False
+        for q in queries:
+            results = self.dk.keyword_search(q, limit=20)
+            is_mock = is_mock or results.get("_mock", False)
+            for p in results.get("Products", []):
+                pn = p.get("ManufacturerPartNumber", "")
+                base_pn = re.sub(r'[-]?(TR|CT|DKR)$', '', pn)
+                desc = p.get("Description", "").lower()
+                if any(skip in desc for skip in ["eval", "kit", "demo"]):
+                    continue
+                if base_pn not in seen_base_pns:
+                    seen_base_pns.add(base_pn)
+                    products.append(p)
+
+        candidates = []
+        for p in products:
+            params = self._parse_magnetics_params(p.get("Parameters", []))
+            price = p.get("UnitPrice", 0)
+            if budget and price > budget:
+                continue
+            candidates.append({
+                "part_number": p.get("ManufacturerPartNumber", ""),
+                "manufacturer": p.get("Manufacturer", ""),
+                "price": price,
+                "stock": p.get("QuantityAvailable", 0),
+                "datasheet": p.get("DatasheetUrl", ""),
+                "description": p.get("Description", ""),
+                "params": params,
+            })
+
+        return {
+            "mag_type": mag_type,
+            "candidates": self._diversify_by_vendor(candidates),
+            "mock": is_mock,
+        }
+
+    @staticmethod
+    def _parse_magnetics_params(parameters: list) -> dict:
+        specs = {}
+        for p in parameters:
+            name = p.get("Name", "")
+            value = p.get("Value", "")
+            if "Inductance" in name and "Tolerance" not in name:
+                specs["inductance"] = value
+            elif "Current Rating" in name or "Current - Max" in name:
+                specs["current_rating"] = value
+            elif "Current - Saturation" in name:
+                specs["i_sat"] = value
+            elif "DC Resistance" in name or "DCR" in name:
+                specs["dcr"] = value
+            elif "Material" in name:
+                specs["material"] = value
+            elif "Core Type" in name or "Type" in name:
+                specs["core_type"] = value
+            elif "Shielding" in name:
+                specs["shielding"] = value
+            elif "Size" in name or "Dimensions" in name:
+                specs["size"] = value
+            elif "Package" in name or "Case" in name:
+                specs["package"] = value
+            elif "Mounting" in name:
+                specs["mounting"] = value
+            elif "Frequency" in name:
+                specs["frequency"] = value
+            elif "Impedance" in name:
+                specs["impedance"] = value
+            elif "Turns Ratio" in name:
+                specs["turns_ratio"] = value
+            elif "Voltage - Isolation" in name:
+                specs["isolation"] = value
+        return specs
+
+    # ================================================================
+    # Cross-Reference / Substitution
+    # ================================================================
+
+    def find_substitutes(self, part_number: str) -> dict:
+        """Find substitute/alternative parts for a given component.
+
+        Uses DigiKey substitutions API + keyword search for alternatives.
+
+        Args:
+            part_number: Manufacturer part number to find alternatives for.
+
+        Returns:
+            Dict with original part info and substitute candidates.
+        """
+        # First, get the original part details
+        original = None
+        search_results = self.dk.keyword_search(part_number, limit=5)
+        for p in search_results.get("Products", []):
+            if part_number.upper() in p.get("ManufacturerPartNumber", "").upper():
+                original = {
+                    "part_number": p.get("ManufacturerPartNumber", ""),
+                    "manufacturer": p.get("Manufacturer", ""),
+                    "description": p.get("Description", ""),
+                    "price": p.get("UnitPrice", 0),
+                    "stock": p.get("QuantityAvailable", 0),
+                    "params": parse_from_digikey_params(p.get("Parameters", [])),
+                    "digikey_pn": p.get("DigiKeyPartNumber", ""),
+                    "datasheet": p.get("DatasheetUrl", ""),
+                }
+                break
+
+        if not original:
+            return {
+                "error": f"Part {part_number} not found on DigiKey",
+                "part_number": part_number,
+                "substitutes": [],
+            }
+
+        # Try DigiKey substitutions API
+        substitutes = []
+        if original.get("digikey_pn"):
+            try:
+                subs = self.dk.search_substitutions(original["digikey_pn"])
+                for s in subs.get("Substitutions", []):
+                    substitutes.append({
+                        "part_number": s.get("ManufacturerPartNumber",
+                                             s.get("ManufacturerProductNumber", "")),
+                        "manufacturer": s.get("Manufacturer", ""),
+                        "description": s.get("Description", ""),
+                        "source": "DigiKey substitution",
+                    })
+            except Exception:
+                pass
+
+        # Also search by key specs to find functional equivalents
+        params = original["params"]
+        desc = original.get("description", "")
+
+        # Build a parametric search query from the original part
+        equiv_queries = []
+        if params.get("Vds_max") and params.get("Rds_on"):
+            # MOSFET cross-reference
+            equiv_queries.append(
+                f"MOSFET {int(params['Vds_max'])}V {int(params['Rds_on'])}mOhm")
+        elif params.get("Io_source") and params.get("isolation_voltage"):
+            # Gate driver cross-reference
+            equiv_queries.append(
+                f"gate driver isolated {int(params['Io_source'])}A")
+        elif "capacitor" in desc.lower() or "cap" in desc.lower():
+            equiv_queries.append(desc[:50])
+        else:
+            # Generic: use description keywords
+            equiv_queries.append(desc[:40])
+
+        seen_pns = {original["part_number"].upper()}
+        for s in substitutes:
+            seen_pns.add(s.get("part_number", "").upper())
+
+        for q in equiv_queries:
+            results = self.dk.keyword_search(q, limit=15)
+            for p in results.get("Products", []):
+                pn = p.get("ManufacturerPartNumber", "")
+                if pn.upper() not in seen_pns:
+                    seen_pns.add(pn.upper())
+                    sub_params = parse_from_digikey_params(p.get("Parameters", []))
+                    substitutes.append({
+                        "part_number": pn,
+                        "manufacturer": p.get("Manufacturer", ""),
+                        "description": p.get("Description", ""),
+                        "price": p.get("UnitPrice", 0),
+                        "stock": p.get("QuantityAvailable", 0),
+                        "params": sub_params,
+                        "source": "parametric search",
+                    })
+
+        return {
+            "original": original,
+            "substitutes": self._diversify_by_vendor(substitutes),
+            "mock": search_results.get("_mock", False),
+        }

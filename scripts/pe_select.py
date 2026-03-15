@@ -474,6 +474,122 @@ def cmd_bootstrap(args):
         print(f"  Note: {n}")
 
 
+def cmd_capacitor(args):
+    """Search capacitors for PE applications."""
+    sel = PowerComponentSelector()
+    result = sel.select_capacitor({
+        "cap_type": args.cap_type,
+        "voltage": args.voltage,
+        "budget": args.budget,
+    })
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    mock_tag = " [MOCK DATA]" if result.get("mock") else ""
+    print(f"\n{'='*70}")
+    print(f"Capacitor Search: {args.cap_type.upper()}{mock_tag}")
+    print(f"  Voltage: {args.voltage}V")
+    print(f"{'='*70}\n")
+
+    candidates = result.get("candidates", [])
+    if not candidates:
+        print("No candidates found.")
+        return
+
+    header = f"{'#':<3} {'Part':<25} {'Mfr':<18} {'Cap':<12} {'Voltage':<10} {'Type':<10} {'$'}"
+    print(header)
+    print("-" * len(header))
+    for i, c in enumerate(candidates[:30], 1):
+        p = c.get("params", {})
+        print(
+            f"{i:<3} {c['part_number'][:24]:<25} "
+            f"{c['manufacturer'][:17]:<18} "
+            f"{str(p.get('capacitance', '-'))[:11]:<12} "
+            f"{str(p.get('voltage_rated_str', '-'))[:9]:<10} "
+            f"{str(p.get('dielectric', '-'))[:9]:<10} "
+            f"${c.get('price', 0):.2f}"
+        )
+
+
+def cmd_magnetics(args):
+    """Search magnetic components."""
+    sel = PowerComponentSelector()
+    result = sel.select_magnetics({
+        "mag_type": args.mag_type,
+        "current": args.current,
+        "budget": args.budget,
+    })
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    mock_tag = " [MOCK DATA]" if result.get("mock") else ""
+    print(f"\n{'='*70}")
+    print(f"Magnetics Search: {args.mag_type.upper()}{mock_tag}")
+    if args.mag_type not in ("ferrite_core", "nanocrystalline", "bobbin"):
+        print(f"  Current: {args.current}A")
+    print(f"{'='*70}\n")
+
+    candidates = result.get("candidates", [])
+    if not candidates:
+        print("No candidates found.")
+        return
+
+    header = f"{'#':<3} {'Part':<25} {'Mfr':<18} {'Description':<40} {'$'}"
+    print(header)
+    print("-" * len(header))
+    for i, c in enumerate(candidates[:30], 1):
+        desc = c.get('description', '')[:39]
+        print(
+            f"{i:<3} {c['part_number'][:24]:<25} "
+            f"{c['manufacturer'][:17]:<18} "
+            f"{desc:<40} "
+            f"${c.get('price', 0):.2f}"
+        )
+
+
+def cmd_xref(args):
+    """Find substitute/alternative parts."""
+    sel = PowerComponentSelector()
+    result = sel.find_substitutes(args.part_number)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return
+
+    orig = result["original"]
+    print(f"\n{'='*70}")
+    print(f"Cross-Reference: {orig['part_number']} ({orig['manufacturer']})")
+    print(f"  {orig['description']}")
+    print(f"  Price: ${orig.get('price', 0):.2f}  Stock: {orig.get('stock', '?')}")
+    print(f"{'='*70}\n")
+
+    subs = result.get("substitutes", [])
+    if not subs:
+        print("No substitutes found.")
+        return
+
+    header = f"{'#':<3} {'Part':<25} {'Mfr':<18} {'Description':<35} {'$':<7} {'Stock':<8} {'Source'}"
+    print(header)
+    print("-" * len(header))
+    for i, s in enumerate(subs[:20], 1):
+        print(
+            f"{i:<3} {s.get('part_number', '')[:24]:<25} "
+            f"{s.get('manufacturer', '')[:17]:<18} "
+            f"{s.get('description', '')[:34]:<35} "
+            f"${s.get('price', 0) or 0:<6.2f} "
+            f"{str(s.get('stock', '-'))[:7]:<8} "
+            f"{s.get('source', '')}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Power Electronics Component Selection Tool"
@@ -581,6 +697,30 @@ def main():
     bsp.add_argument("--vcc", type=float, default=15.0, help="Driver supply voltage [V]")
     bsp.add_argument("--json", action="store_true")
 
+    # Capacitor selection
+    cp = sub.add_parser("capacitor", help="Search capacitors for PE applications")
+    cp.add_argument("--type", dest="cap_type", default="dc_link",
+                    choices=["dc_link", "resonant", "filter", "emi_x", "emi_y",
+                             "snubber", "bootstrap"])
+    cp.add_argument("--voltage", type=float, default=400, help="Voltage rating [V]")
+    cp.add_argument("--budget", type=float, help="Max price [USD]")
+    cp.add_argument("--json", action="store_true")
+
+    # Magnetics selection
+    mg = sub.add_parser("magnetics", help="Search magnetic components")
+    mg.add_argument("--type", dest="mag_type", default="ferrite_core",
+                    choices=["ferrite_core", "nanocrystalline", "inductor",
+                             "pfc_inductor", "transformer", "bobbin", "cmc",
+                             "emi_filter"])
+    mg.add_argument("--current", type=float, default=10, help="Current rating [A]")
+    mg.add_argument("--budget", type=float, help="Max price [USD]")
+    mg.add_argument("--json", action="store_true")
+
+    # Cross-reference / substitution
+    xr = sub.add_parser("xref", help="Find substitute/alternative parts")
+    xr.add_argument("part_number", help="Part number to find alternatives for")
+    xr.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -597,6 +737,9 @@ def main():
         "bom": cmd_bom,
         "gate-resistor": cmd_gate_resistor,
         "bootstrap": cmd_bootstrap,
+        "capacitor": cmd_capacitor,
+        "magnetics": cmd_magnetics,
+        "xref": cmd_xref,
     }
     cmds[args.command](args)
 
