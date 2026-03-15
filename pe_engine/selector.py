@@ -824,6 +824,12 @@ class PowerComponentSelector:
         candidates = []
         for p in products:
             params = self._parse_capacitor_params(p.get("Parameters", []))
+
+            # Filter: voltage rating must meet or exceed the requirement
+            v_rated = params.get("voltage_rated")
+            if v_rated is not None and v_rated < voltage:
+                continue
+
             price = p.get("UnitPrice", 0)
             if budget and price > budget:
                 continue
