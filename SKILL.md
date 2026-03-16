@@ -1,8 +1,8 @@
 ---
 name: pe-select
-description: Intelligent power electronics component selection with FOM analysis, loss estimation, BOM optimization, and CSV export. Use when user needs to select MOSFETs, gate drivers, or capacitors for power converters (DAB, LLC, CLLC, buck, boost, NPC, PFC).
+description: Intelligent power electronics component selection — MOSFETs, gate drivers, capacitors, magnetic components, power modules, BOM optimization, KiCad footprint download, and cross-reference. Supports DAB, LLC, CLLC, buck, boost, NPC, PFC, and more.
 disable-model-invocation: true
-argument-hint: [mosfet|gate-driver|parse|fom|symbols|bom|gate-resistor|bootstrap] [options]
+argument-hint: [mosfet|gate-driver|capacitor|magnetics|xref|symbols|bom|parse|fom|gate-resistor|bootstrap] [options]
 allowed-tools: Bash(python *), Read, Grep
 ---
 
@@ -54,8 +54,32 @@ python scripts/pe_select.py parse /path/to/datasheet.pdf
 # Calculate FOMs directly
 python scripts/pe_select.py fom --rds 25 --qg 95 --qoss 42 --coss 500 --price 8.50
 
-# Fetch symbols/footprints (KiCad 9 + Altium)
-python scripts/pe_select.py symbols C3M0025065K --kicad --altium
+# Fetch KiCad symbols/footprints (auto: MPN → LCSC → easyeda2kicad)
+python scripts/pe_select.py symbols UCC21530DWKR --kicad
+
+# Capacitor search: 400V DC-link film caps
+python scripts/pe_select.py capacitor --type dc_link --voltage 400 --capacitance 10uF
+
+# Capacitor search: EMI X2 safety caps
+python scripts/pe_select.py capacitor --type emi_x
+
+# Magnetics: ferrite cores
+python scripts/pe_select.py magnetics --type ferrite_core
+
+# Magnetics: nanocrystalline toroidal cores
+python scripts/pe_select.py magnetics --type nanocrystalline
+
+# Magnetics: common mode chokes 15A
+python scripts/pe_select.py magnetics --type cmc --current 15
+
+# Magnetics: PFC inductors, EMI filters, transformers, bobbins
+python scripts/pe_select.py magnetics --type pfc_inductor --current 20
+python scripts/pe_select.py magnetics --type emi_filter --current 10
+python scripts/pe_select.py magnetics --type transformer
+python scripts/pe_select.py magnetics --type bobbin
+
+# Cross-reference: find alternatives for a part
+python scripts/pe_select.py xref C3M0025065K
 ```
 
 ### How to Handle User Queries
@@ -108,6 +132,22 @@ python scripts/pe_select.py symbols C3M0025065K --kicad --altium
    → Show minimum and recommended capacitor value
    → Include voltage rating and dielectric recommendations
 
+10. **"I need DC-link caps for a 400V/5kW converter"**
+    → Run `capacitor --type dc_link --voltage 400 --capacitance 10uF`
+    → Results filtered: only caps with voltage rating ≥ user requirement
+    → Show capacitance, voltage, dielectric, price from multiple vendors
+
+11. **"Find ferrite cores / nanocrystalline cores / CMC / EMI filter"**
+    → Run `magnetics --type ferrite_core` or `nanocrystalline` or `cmc --current 15`
+    → Covers: ferrite (E/PQ/RM/ETD/toroidal), nanocrystalline, amorphous
+    → Also: inductors, PFC inductors, transformers, bobbins, CMC, EMI filters
+
+12. **"This part is discontinued, find alternatives"**
+    → Run `xref <part_number>`
+    → Uses DigiKey substitutions API + parametric search
+    → Auto-detects component type, builds targeted search
+    → Vendor-diversified results
+
 ### FOM Knowledge Base
 
 **Topology-specific FOM priorities:**
@@ -129,10 +169,9 @@ python scripts/pe_select.py symbols C3M0025065K --kicad --altium
 - SiC MOSFET: 80% derating standard
 - Ceramic cap: 50% derating (capacitance drops with DC bias)
 
-### Always Mention:
-- Whether results are from mock data or real API
-- FOM values and what they mean for the specific topology
-- Voltage derating pass/fail
-- Gate driver compatibility requirements
-- Thermal considerations if losses are significant
-- Inventory alerts for low-stock components
+### Important Notes:
+- FOM ranking is a **reference only** — actual loss calculation depends on user's specific topology, modulation, and operating conditions
+- Capacitor results are **filtered by minimum voltage** — caps below user's voltage requirement are excluded
+- Gate driver results are **vendor-diversified** — no single vendor dominates the list
+- SiC turn-off options: -5V, -2V, or 0V with active Miller clamp — all valid
+- Symbol/footprint download uses easyeda2kicad (free, no API key needed)
